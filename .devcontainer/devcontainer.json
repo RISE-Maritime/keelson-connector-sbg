@@ -1,0 +1,45 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/python
+{
+	"name": "SBG Logger DevContainer",
+	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+	"image": "mcr.microsoft.com/devcontainers/python:dev-3.12-bookworm",
+	"features": {
+		"ghcr.io/devcontainers/features/docker-in-docker:2": {}
+	},
+	"runArgs": [
+		"--network=host",
+		"--privileged",
+		"--name=devcon-sbg",
+		"--device=/dev/ttyUSB0:/dev/ttyUSB0"
+	],
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	// "features": {},
+	// Use 'forwardPorts' to make a list of ports inside the container available locally.
+	// "forwardPorts": [],
+	// Use 'postCreateCommand' to run commands after the container is created.
+	"remoteUser": "root",
+	"postCreateCommand": "pip install --upgrade pip && pip install --user -r requirements_dev.txt && \
+		apt-get update && apt-get install -y wget unzip cmake build-essential libusb-1.0-0-dev && \
+		cd /tmp && \
+		wget https://download.sbg-systems.com/dev/sbgECom-3.2.765.zip -O sbgECom.zip && \
+		unzip sbgECom.zip -d sbgECom && rm sbgECom.zip && \
+		cd sbgECom && \
+		cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local && \
+		cmake --build build -- -j$(nproc) && \
+		cmake --install build && \
+		ln -s /usr/local/bin/tools/sbgBasicLogger/sbgBasicLogger /usr/local/bin/sbgBasicLogger && \
+		ln -s /usr/local/bin/tools/sbgEComApi/sbgEComApi /usr/local/bin/sbgEComApi"
+		,
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"github.vscode-github-actions",
+				"ms-python.black-formatter",
+				"ms-toolsai.jupyter"
+			]
+		}
+	}
+	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+	// "remoteUser": "root"
+}

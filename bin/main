@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+
+import zenoh
+import logging
+import warnings
+import json
+import keelson
+from terminal_inputs import terminal_inputs
+from keelson.payloads.Primitives_pb2 import TimestampedString
+from keelson.payloads.Decomposed3DVector_pb2 import Decomposed3DVector
+from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
+import sys
+import time
+import socket
+from datetime import datetime
+
+# Global variables
+session = None
+args = None
+sock = None
+latest_os_message = None
+last_received_time = None
+udp_server_address = None
+deg2rad = lambda x : x * 0.0174533
+g2ms = lambda x : x * 9.80665 
+
+
+
+
+if __name__ == "__main__":
+    # Input arguments and configurations
+    args = terminal_inputs()
+    # Setup logger
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s [%(lineno)d]: %(message)s", level=args.log_level
+    )
+
+    logging.captureWarnings(True)
+    warnings.filterwarnings("once")
+    # initiate logging
+    zenoh.init_log_from_env_or("error")
+
+    # Construct session
+    logging.info("Opening Zenoh session...")
+    conf = zenoh.Config()
+
+    if args.mode is not None:
+        conf.insert_json5("mode", json.dumps(args.mode))
+    if args.connect is not None:
+        conf.insert_json5("connect/endpoints", json.dumps(args.connect))
+
+    with zenoh.open(conf) as session:
+
+        #################################################
+        # Setting up Publishers
+
+        if "raw" in args.publish:
+            keyexp_pub_raw = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="raw_json",
+                source_id=args.source_id,
+            )
+            pub_raw = session.declare_publisher(
+                keyexp_pub_raw, congestion_control=zenoh.CongestionControl.DROP, priority=zenoh.Priority.DEFAULT)
+            logging.info(f"Publishing to: {keyexp_pub_raw}")
+
+        if "imu" in args.publish:
+            # Acceleration
+            keyexp_pub_imu_acc = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="linear_acceleration_mpss",
+                source_id=args.source_id,
+            )
+            pub_imu_acc = session.declare_publisher(
+                keyexp_pub_imu_acc, congestion_control=zenoh.CongestionControl.DROP, priority=zenoh.Priority.DEFAULT)
+            logging.info(f"Publishing to: {keyexp_pub_imu_acc}")
+
+            # Velocity
+            keyexp_pub_imu_vel = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="angular_velocity_radps",
+                source_id=args.source_id,
+            )
+            pub_imu_vel = session.declare_publisher(
+                keyexp_pub_imu_vel, congestion_control=zenoh.CongestionControl.DROP, priority=zenoh.Priority.DEFAULT)
+            logging.info(f"Publishing to: {keyexp_pub_imu_vel}")
+
+        if "pos" in args.publish:
+            keyexp_pub_pos = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="location_fix",
+                source_id=args.source_id,
+            )
+            pub_pos = session.declare_publisher(
+                keyexp_pub_pos, congestion_control=zenoh.CongestionControl.DROP, priority=zenoh.Priority.DEFAULT)
+            logging.info(f"Publishing to: {keyexp_pub_pos}")
+
+   
+            # Added frequency tracking for IMU
+            last_time_imu = time.time()
+            imu_count = 0
+
+            # Added frequency tracking for INS
+            last_time_ins = time.time()
+            ins_count = 0
+
+            logging.info("Press CTRL-C to quit...")
+
+
+            try:      
+
+                # Using socat to read from the serial port
+                for line in sys.stdin.buffer:
+                    if not line:
+                        continue
+
+                    try:
+                        # Decode incoming data
+                        msg_str = line.decode('utf-8', errors='ignore')
+                        msg = msg_str.split(",")
+
+                        # Publish the raw data
+                        if "raw" in args.publish:
+                            payload_raw = TimestampedString()
+                            payload_raw.timestamp.FromNanoseconds(
+                                int(datetime.now().timestamp() * 1e9))
+                            payload_raw.value = msg_str
+                            serialized_payload = payload_raw.SerializeToString()
+                            envelope = keelson.enclose(serialized_payload)
+                            pub_raw.put(envelope)
+
+
+                        # IMU message
+                        if msg[0] == "#APIMU":
+                            imu_count += 1
+                            if (time.time() - last_time_imu) >= 5:
+                                freq_imu = imu_count / 5.0
+                                logging.info(f"IMU frequency: {freq_imu} Hz")
+                                imu_count = 0
+                                last_time_imu = time.time()
+                            # Calculate and log the frequency of APIMU messages every 5 seconds
+
+     
+
+                            if "imu" in args.publish:
+
+                                logging.debug(f"IMU Data Received:: {msg}")
+
+                                # Acceleration 
+                                payload_imu_acc = Decomposed3DVector()
+
+                                payload_imu_acc.timestamp.FromNanoseconds(int(datetime.now().timestamp() * 1e9))
+                                
+                                if args.frame_id is not None:
+                                    payload_imu_acc.frame_id = args.frame_id
+                                payload_imu_acc.vector.x = g2ms(float(msg[2]))
+                                payload_imu_acc.vector.y = g2ms(float(msg[3]))
+                                payload_imu_acc.vector.z = g2ms(float(msg[4]))
+
+                                serialized_payload = payload_imu_acc.SerializeToString()
+                                envelope = keelson.enclose(serialized_payload)
+                                pub_imu_acc.put(envelope)
+
+                                # Velocity
+                                payload_imu_vel = Decomposed3DVector()
+                                payload_imu_vel.timestamp.FromNanoseconds(int(datetime.now().timestamp() * 1e9))
+                                if args.frame_id is not None:
+                                    payload_imu_vel.frame_id = args.frame_id
+                                payload_imu_vel.vector.x = deg2rad(float(msg[5]))
+                                payload_imu_vel.vector.y = deg2rad(float(msg[6]))
+                                payload_imu_vel.vector.z = deg2rad(float(msg[9])) # 7 gyro,  9 the optical gyro
+
+                                serialized_payload = payload_imu_vel.SerializeToString()
+                                envelope = keelson.enclose(serialized_payload)
+                                pub_imu_vel.put(envelope)
+
+                                logging.debug(f"IMU SENT")
+
+
+                        elif msg[0] == "#APINS":
+                            ins_count += 1
+
+                            if (time.time() - last_time_ins) >= 5:
+                                freq_ins = ins_count / 5.0
+                                logging.info(f"INS frequency: {freq_ins} Hz")
+                                ins_count = 0
+                                last_time_ins = time.time()
+                            
+                            logging.debug(f"INS Data Received: {msg}")
+
+
+                            logging.debug(
+                                f"INS Data Received: Time since power on: {msg[1]} ms, "
+                                f"Time PPS: {msg[2]} ns, Status: {msg[3]} enum, "
+                                f"Latitude: {msg[4]} deg, Longitude: {msg[5]} deg, "
+                                f"Altitude: {msg[6]} m, Velocity North: {msg[7]} m/s, "
+                                f"Velocity East: {msg[8]} m/s, Velocity Down: {msg[9]} m/s, "
+                                f"Roll: {msg[10]} deg, Pitch: {msg[11]} deg, "
+                                f"Heading: {msg[12]} deg, Is Stationary: {msg[13]} enum"
+                            )
+
+                            if "pos" in args.publish:
+                                payload_pos = LocationFix()
+                                payload_pos.frame_id = args.frame_id
+                                payload_pos.timestamp.FromNanoseconds(
+                                    # TODO: improve this
+                                    int(datetime.now().timestamp() * 1e9))
+                                payload_pos.latitude = float(msg[4])
+                                payload_pos.longitude = float(msg[5])
+                                payload_pos.altitude = float(msg[6])
+
+                                # Publish the position fix
+                                serialized_payload = payload_pos.SerializeToString()
+                                envelope = keelson.enclose(serialized_payload)
+                                pub_pos.put(envelope)
+                                logging.debug(f"Position Fix SENT")
+
+                            
+                        elif msg[0] == "#APGPS":
+                            logging.debug(f"API GPS {msg}")
+
+                        else:
+                            logging.debug(f"Unknown message type: {msg[0]}")
+                    
+                    except ValueError as e:
+                        logging.error(f"ValueError: {e}")
+                        logging.debug(f"Failed to parse message: {msg_str}")
+                    except IndexError as e:
+                        logging.error(f"IndexError: {e}")
+                        logging.debug(f"Message format error: {msg_str}")
+                    except KeyboardInterrupt:
+                        logging.info("Keyboard interrupt received, exiting...")
+                        break
+                    except Exception as e:
+                        logging.error(f"An unexpected error occurred: {e}")
+                        logging.debug(f"Failed to process message: {msg_str}")
+
+
+            except socket.timeout:
+                logging.warning("Socket timed out, no data received...")
+            except KeyboardInterrupt:
+                logging.info("Keyboard interrupt received, exiting...")
+            except Exception as e:
+                logging.error(f"An error occurred: {e}")
+                
+
+
+
