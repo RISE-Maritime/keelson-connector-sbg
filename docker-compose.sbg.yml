@@ -1,12 +1,14 @@
 services:
   keelson-processor-sbg:
     build: .
-    # image: ghcr.io/your-org/sbg-logger:latest  # optional if pushing to registry
+    # image: keelson-processor-sbg:latest
     container_name: sbg-logger
     restart: unless-stopped
     network_mode: "host"
     privileged: true
     devices:
       - /dev/ttyUSB0:/dev/ttyUSB0
-    command: >
-      sbgBasicLogger -s /dev/ttyUSB0 -r 115200 -p
+    command: ["-s", "/dev/ttyUSB0", "-r", "115200", "-p", "--time-mode=utcIso8601", "--status-format=decimal"]
+    environment:
+      - PYTHON_ARGS=--log-level 10 --entity-id storkrabban --source-id sbg/0 --pub-raw --pub-location-fix
+    

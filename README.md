@@ -2,6 +2,11 @@
 
 Tools for logging SGB units using the sbgECom [GITHUB LINK](https://github.com/SBG-Systems/sbgECom)
 
+OBS! This connector is for reading realtime data (6 decimals), if need accurate data the sbgBasicLogger (9 decimals) should be used directly.
+
+```bash
+sbgBasicLogger -s /dev/ttyUSB0 -r 115200 -p --time-mode=utcIso8601 --status-format=decimal -w 
+```
 
 ## Quick start
 
@@ -10,9 +15,7 @@ Tools for logging SGB units using the sbgECom [GITHUB LINK](https://github.com/S
 # UDP
 socat -u UDP4-RECV:2033,reuseaddr STDOUT | bin/main --log-level 10 -r rise -e storakrabban --publish raw --publish imu --publish pos 
 
-sbgBasicLogger -s /dev/ttyUSB0 -r 115200 -p |
-
-
+sbgBasicLogger -s /dev/ttyUSB0 -r 115200 -p 
 ```
 
 ## Record Data with Keelson MCAP
@@ -23,7 +26,28 @@ sudo docker run --rm --network host  --name mcap-logger --volume ~/rec:/rec ghcr
 
 ```
 
- --mode client --connect tcp/10.10.7.2:7448
+
+
+## SBG Ellipse N
+
+SBG device and streaming all the sensor data:
+
+✅ euler - Euler angles (roll/pitch/yaw)
+✅ quat - Quaternion orientation
+✅ nav - Navigation data with GPS coordinates
+✅ airData - Air pressure data
+✅ imuData - IMU sensor data (accelerometer/gyroscope)
+✅ mag - Magnetometer data
+✅ shipMotion - Ship motion data
+✅ gnss1Vel - GNSS velocity data
+✅ gnss1Pos - GNSS position data
+✅ status - System status
+✅ utcTime - UTC timestamps
+
+
+
+
+
 
 
 Setup for development environment on your own computer: ´

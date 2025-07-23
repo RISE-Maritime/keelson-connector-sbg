@@ -1,9 +1,9 @@
-FROM ghcr.io/rise-maritime/porla:v0.4.1
+FROM ubuntu:22.04
 
 # Set environment
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies
+# Install build dependencies and runtime requirements
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -11,27 +11,33 @@ RUN apt-get update && apt-get install -y \
     wget \
     unzip \
     libusb-1.0-0-dev \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python requirements
 COPY requirements.txt requirements.txt
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Download and build SBG SDK
+# Clone and build SBG SDK
 WORKDIR /opt
-RUN wget https://download.sbg-systems.com/dev/sbgECom-3.2.765.zip -O sbgECom.zip && \
-    unzip sbgECom.zip -d sbgECom && \
-    rm sbgECom.zip
+RUN git clone https://github.com/SBG-Systems/sbgECom.git
 
 WORKDIR /opt/sbgECom
-RUN cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local && \
-    cmake --build build -- -j$(nproc) && \
+RUN cmake -Bbuild -DBUILD_EXAMPLES=ON -DBUILD_TOOLS=ON && \
+    cmake --build build --config Release && \
     cmake --install build && \
-    ln -s /usr/local/bin/tools/sbgBasicLogger/sbgBasicLogger /usr/local/bin/sbgBasicLogger
+    cp build/sbgBasicLogger /usr/local/bin/sbgBasicLogger && \
+    chmod +x /usr/local/bin/sbgBasicLogger
 
 # Copy user-provided binaries
 COPY --chmod=555 ./bin/* /usr/local/bin/
 
-# Final entrypoint
-ENTRYPOINT ["/tini", "-g", "--", "/bin/bash", "-c"]
+WORKDIR /app
 
+# Create a wrapper script to pipe sbgBasicLogger output to Python script
+RUN echo '#!/bin/bash\nsbgBasicLogger "$@" | python3 /usr/local/bin/main ${PYTHON_ARGS:-}' > /usr/local/bin/sbg-connector.sh && \
+    chmod +x /usr/local/bin/sbg-connector.sh
+
+# Use the wrapper script as entrypoint
+ENTRYPOINT ["/usr/local/bin/sbg-connector.sh"]

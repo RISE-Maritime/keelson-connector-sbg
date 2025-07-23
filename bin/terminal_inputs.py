@@ -5,7 +5,7 @@ def terminal_inputs():
     """Parse the terminal inputs and return the arguments"""
 
     parser = argparse.ArgumentParser(
-        prog="keelson_connector_anello",
+        prog="keelson_connector_sbg",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -66,30 +66,21 @@ def terminal_inputs():
     )
 
     parser.add_argument(
-        "-p",
-        "--publish",
-        choices=["raw","imu", "ins","pos"],
-        type=str,
-        required=False,
-        action="append",
+        "--pub-raw",
+        dest="publish_raw",
+        action="store_true",
+        default=False,
+        help="Publish raw data from sbgBasicLogger",
     )
 
     parser.add_argument(
-        "--udp-host",
-        type=str,
-        required=False,
-        default="127.0.0.1",
-        help="UDP host Anello data is sent to",
+        "--pub-location-fix",
+        dest="publish_location_fix",
+        action="store_true",
+        default=True,
+        help="Publish location fix that includes position and altitude",
     )
 
-    parser.add_argument(
-        "--udp-port-data",
-        type=int,
-        required=False,
-        default=2033,
-        help="UDP port Anello data is sent to",
-    )
-    
     # Parse arguments and start doing our thing
     args = parser.parse_args()
 

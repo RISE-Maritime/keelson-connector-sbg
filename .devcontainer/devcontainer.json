@@ -19,18 +19,7 @@
 	// "forwardPorts": [],
 	// Use 'postCreateCommand' to run commands after the container is created.
 	"remoteUser": "root",
-	"postCreateCommand": "pip install --upgrade pip && pip install --user -r requirements_dev.txt && \
-		apt-get update && apt-get install -y wget unzip cmake build-essential libusb-1.0-0-dev && \
-		cd /tmp && \
-		wget https://download.sbg-systems.com/dev/sbgECom-3.2.765.zip -O sbgECom.zip && \
-		unzip sbgECom.zip -d sbgECom && rm sbgECom.zip && \
-		cd sbgECom && \
-		cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local && \
-		cmake --build build -- -j$(nproc) && \
-		cmake --install build && \
-		ln -s /usr/local/bin/tools/sbgBasicLogger/sbgBasicLogger /usr/local/bin/sbgBasicLogger && \
-		ln -s /usr/local/bin/tools/sbgEComApi/sbgEComApi /usr/local/bin/sbgEComApi"
-		,
+	"postCreateCommand": "pip install --upgrade pip && pip install --user -r requirements_dev.txt && apt-get update && apt-get install -y wget unzip cmake build-essential libusb-1.0-0-dev && echo 'Attempting to download SBG ECom library...' && cd /tmp && (wget https://download.sbg-systems.com/dev/sbgECom-3.2.765.zip -O sbgECom.zip && unzip sbgECom.zip -d sbgECom && rm sbgECom.zip && cd sbgECom && cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local && cmake --build build -- -j$(nproc) && cmake --install build && ln -s /usr/local/bin/tools/sbgBasicLogger/sbgBasicLogger /usr/local/bin/sbgBasicLogger && ln -s /usr/local/bin/tools/sbgEComApi/sbgEComApi /usr/local/bin/sbgEComApi && echo 'SBG ECom library installed successfully') || echo 'WARNING: Failed to download SBG ECom library. You may need to install it manually later.'",
 	"customizations": {
 		"vscode": {
 			"extensions": [
