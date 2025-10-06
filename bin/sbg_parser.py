@@ -91,9 +91,9 @@ def parse_ship_motion_line(line: str) -> ShipMotion:
 @dataclass
 class AirData:
     status: str
-    pressureAbs_pa: int
+    pressureAbs_pa: float
     altitude_meters: float
-    pressureDiff_pa: int
+    pressureDiff_pa: float
     trueAirspeed_mps: float
     airTemperature_degC: float
 
@@ -104,17 +104,28 @@ def parse_air_data_line(line: str) -> AirData:
     # Match the full line and extract the fields
     tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line)
 
-    if len(tokens) != 5:
-        raise ValueError(f"Expected 5 numeric fields, found {len(tokens)}, tokens: {tokens}")
-
-    return AirData(
-        status=tokens[0][0],
-        pressureAbs_pa=int(float(tokens[0][1:])),  # Convert to float first, then to int
-        altitude_meters=float(tokens[1]),
-        pressureDiff_pa=int(float(tokens[2])),  # Convert to float first, then to int
-        trueAirspeed_mps=float(tokens[3]),
-        airTemperature_degC=float(tokens[4])
-    )
+    if len(tokens) == 5:
+        # Handle 5-field format: [pressureAbs_pa, altitude_meters, pressureDiff_pa, trueAirspeed_mps, airTemperature_degC]
+        return AirData(
+            status="0",  # Default status when not provided
+            pressureAbs_pa=float(tokens[0]),
+            altitude_meters=float(tokens[1]),
+            pressureDiff_pa=float(tokens[2]),
+            trueAirspeed_mps=float(tokens[3]),
+            airTemperature_degC=float(tokens[4])
+        )
+    elif len(tokens) == 6:
+        # Handle 6-field format: [status, pressureAbs_pa, altitude_meters, pressureDiff_pa, trueAirspeed_mps, airTemperature_degC]
+        return AirData(
+            status=tokens[0],
+            pressureAbs_pa=float(tokens[1]),
+            altitude_meters=float(tokens[2]),
+            pressureDiff_pa=float(tokens[3]),
+            trueAirspeed_mps=float(tokens[4]),
+            airTemperature_degC=float(tokens[5])
+        )
+    else:
+        raise ValueError(f"Expected 5 or 6 numeric fields, found {len(tokens)}, tokens: {tokens}")
 
 
 @dataclass

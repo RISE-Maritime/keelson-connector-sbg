@@ -32,8 +32,15 @@ from sbg_parser import (
 )
 
 from datetime import datetime, timezone
+import threading
+from collections import defaultdict
 
-# Global variables
+# Global variables for frequency tracking
+message_counts = defaultdict(int)
+last_log_time = time.time()
+log_interval = 10.0  # Log frequency every 10 seconds
+
+# Other global variables
 session = None
 args = None
 sock = None
@@ -42,6 +49,26 @@ last_received_time = None
 udp_server_address = None
 deg2rad = lambda x: x * 0.0174533
 g2ms = lambda x: x * 9.80665
+
+def log_data_rates():
+    """Log data rates for all topics at INFO level"""
+    global message_counts, last_log_time
+    
+    current_time = time.time()
+    time_diff = current_time - last_log_time
+    
+    if time_diff >= log_interval:
+        if message_counts:
+            rates = []
+            for topic, count in message_counts.items():
+                rate = count / time_diff
+                rates.append(f"{topic}: {rate:.1f} Hz")
+            
+            logging.info(f"Data rates - {', '.join(rates)}")
+            
+        # Reset counters
+        message_counts.clear()
+        last_log_time = current_time
 
 
 if __name__ == "__main__":
@@ -119,10 +146,15 @@ if __name__ == "__main__":
                         pub_raw.put(envelope)
                         # logging.debug(f"Published raw data on {keyexp_pub_raw}")
 
-                    topic = decoded_line.split(":")[0]
-                    logging.debug(f"Processing topic: {topic.upper()}")
+                    topic = decoded_line.split(":")[0].strip()
+                    topic_upper = topic.upper()
+                    logging.debug(f"Processing topic: {topic_upper}")
+                    
+                    # Track message frequency
+                    message_counts[topic_upper] += 1
+                    log_data_rates()
 
-                    match topic.upper():
+                    match topic_upper:
 
                         case "NAV":
                             # Process navigation data
@@ -874,7 +906,7 @@ if __name__ == "__main__":
                                 keyexp_mag_acc = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="magnetometer_acceleration_mpss",
+                                    subject="linear_acceleration_mpss",
                                     source_id=args.source_id + "/magnetometer_acceleration",
                                 )
                                 session.put(keyexp_mag_acc, envelope)
@@ -888,7 +920,7 @@ if __name__ == "__main__":
 
                         # Topic not recognized
                         case _:
-                            logging.warning(f"Unknown topic: {topic}")
+                            logging.warning(f"Unknown topic: {topic_upper}")
 
                 except Exception as e:
                     logging.error(f"Error decoding line: {e}")
