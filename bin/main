@@ -113,20 +113,6 @@ if __name__ == "__main__":
             )
             logging.info(f"Publishing to: {keyexp_pub_raw}")
 
-            if args.publish_location_fix:
-                keyexp_pub_pos = keelson.construct_pubsub_key(
-                    base_path=args.realm,
-                    entity_id=args.entity_id,
-                    subject="location_fix",
-                    source_id=args.source_id,
-                )
-                pub_pos = session.declare_publisher(
-                    keyexp_pub_pos,
-                    congestion_control=zenoh.CongestionControl.DROP,
-                    priority=zenoh.Priority.DEFAULT,
-                )
-                logging.info(f"Publishing to: {keyexp_pub_pos}")
-
             logging.info("Reading from stdin...")
             for line in sys.stdin.buffer:
                 if not line:
@@ -177,7 +163,7 @@ if __name__ == "__main__":
                                 keyexp_location_fix = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="location_fix",
+                                    subject="INS_location_fix",
                                     source_id=args.source_id,
                                 )
                                 session.put(keyexp_location_fix, envelope)
@@ -197,7 +183,7 @@ if __name__ == "__main__":
                                 keyexp_ned = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="ned_velocity_mps",
+                                    subject="INS_ned_velocity_mps",
                                     source_id=args.source_id,
                                 )
                                 session.put(keyexp_ned, envelope)
@@ -708,7 +694,7 @@ if __name__ == "__main__":
                                 keyexp_gnss_loc = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="location_fix",
+                                    subject="GNSS_location_fix",
                                     source_id=args.source_id,
                                 )
                                 session.put(keyexp_gnss_loc, envelope)
@@ -732,7 +718,7 @@ if __name__ == "__main__":
                                     keelson.construct_pubsub_key(
                                         base_path=args.realm,
                                         entity_id=args.entity_id,
-                                        subject="location_fix_satellites_used",
+                                        subject="GNSS_location_fix_satellites_used",
                                         source_id=args.source_id,
                                     )
                                 )
@@ -763,7 +749,7 @@ if __name__ == "__main__":
                                 keyexp_gnss_vel = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="ned_velocity_mps",
+                                    subject="GNSS_ned_velocity_mps",
                                     source_id=args.source_id + "/gnss_velocity",
                                 )
                                 session.put(keyexp_gnss_vel, envelope)
@@ -782,7 +768,7 @@ if __name__ == "__main__":
                                 keyexp_gnss_course = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="course_over_ground_deg",
+                                    subject="GNSS_course_over_ground_deg",
                                     source_id=args.source_id + "/gnss_velocity",
                                 )
                                 session.put(keyexp_gnss_course, envelope)
@@ -815,7 +801,7 @@ if __name__ == "__main__":
                                 keyexp_imu_acc = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="linear_acceleration_mpss",
+                                    subject="IMU_linear_acceleration_mpss",
                                     source_id=args.source_id + "/imu_acceleration",
                                 )
                                 session.put(keyexp_imu_acc, envelope)
@@ -836,7 +822,7 @@ if __name__ == "__main__":
                                 keyexp_imu_vel = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="angular_velocity_radps",
+                                    subject="IMU_angular_velocity_radps",
                                     source_id=args.source_id + "/imu_velocity",
                                 )
                                 session.put(keyexp_imu_vel, envelope)
@@ -853,7 +839,7 @@ if __name__ == "__main__":
                                 keyexp_imu_temp = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="imu_temperature_celsius",
+                                    subject="IMU_temperature_celsius",
                                     source_id=args.source_id + "/imu_temperature",
                                 )
                                 session.put(keyexp_imu_temp, envelope)
@@ -906,7 +892,7 @@ if __name__ == "__main__":
                                 keyexp_mag_acc = keelson.construct_pubsub_key(
                                     base_path=args.realm,
                                     entity_id=args.entity_id,
-                                    subject="linear_acceleration_mpss",
+                                    subject="MAG_linear_acceleration_mpss",
                                     source_id=args.source_id + "/magnetometer_acceleration",
                                 )
                                 session.put(keyexp_mag_acc, envelope)
