@@ -476,7 +476,7 @@ def process_air_data(session, args, decoded_line: str) -> None:
     put_timestamped_float(
         session,
         args,
-        "altitude_above_msl_m"
+        "altitude_above_msl_m",
         parsed.altitude_meters,
         timestamp_ns,
         channel="air",
