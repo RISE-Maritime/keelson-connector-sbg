@@ -7,7 +7,7 @@ and forwards the raw correction bytes ([support.sbg-systems.com](https://support
 Ellipse for RTCM input.
 
 Expected RTCM Keelson topic shape:
-    <realm>/<entity_id>/raw_rtcm_v3/<rtcm_source_id>
+    <realm>/<rtcm-entity_id>/raw_rtcm_v3/<rtcm_source_id>
 
 The RTCM payload is expected to be a keelson-enclosed TimestampedBytes message,
 matching the keelson2rtcm connector.
@@ -355,9 +355,11 @@ def setup_rtcm_subscription(session, args):
     rtcm_subject = getattr(args, "rtcm_subject", "raw_rtcm_v3")
     rtcm_source_id = getattr(args, "rtcm_source_id", "**")
 
+    rtcm_entity_id = getattr(args, "rtcm_entity_id", None) or args.entity_id
+
     keyexp_rtcm = keelson.construct_pubsub_key(
         base_path=args.realm,
-        entity_id=args.entity_id,
+        entity_id=rtcm_entity_id,
         subject=rtcm_subject,
         source_id=rtcm_source_id,
     )
