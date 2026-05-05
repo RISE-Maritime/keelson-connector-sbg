@@ -443,7 +443,7 @@ def process_ship_motion(session, args, decoded_line: str) -> None:
 
     timestamp_ns = time.time_ns()
     fields = {
-        "heave_period_sec": parsed.heavePeriod_sec,
+        "heave_period_s": parsed.heavePeriod_sec,
         "surge_m": parsed.surge_m,
         "sway_m": parsed.sway_m,
         "heave_m": parsed.heave_m,
@@ -476,7 +476,7 @@ def process_air_data(session, args, decoded_line: str) -> None:
     put_timestamped_float(
         session,
         args,
-        "altitude_msl_m",
+        "altitude_above_msl_m"
         parsed.altitude_meters,
         timestamp_ns,
         channel="air",
@@ -585,14 +585,9 @@ def process_gnss_pos(session, args, decoded_line: str) -> None:
     )
 
     int_fields = {
-        "location_fix_satellites_tracked": parsed.satellites_tracked,
+        "location_fix_satellites_visible": parsed.satellites_tracked,
         "location_fix_satellites_used": parsed.numSatellitesUsed,
-        "position_status_raw": raw_status,
-        "position_status": position_status,
-        "position_type": position_type,
-        "rtk_status": rtk_status,
-        "position_status_ext_raw": raw_status_ext,
-        "base_station_id": parsed.baseStationId,
+        "gnss_aiding_status": rtk_status,
     }
 
     for subject, value in int_fields.items():
@@ -605,13 +600,16 @@ def process_gnss_pos(session, args, decoded_line: str) -> None:
             channel="gnss",
         )
 
-    put_timestamped_float(
-        session,
-        args,
-        "differential_age_sec",
+    logger.debug(
+        "GNSS diagnostics: raw_status=%s, status_ext=%s, "
+        "position_status=%s, position_type=%s, base_station_id=%s, "
+        "diff_age_seconds=%.2f",
+        raw_status,
+        raw_status_ext,
+        position_status,
+        position_type,
+        parsed.baseStationId,
         diff_age_seconds,
-        timestamp_ns,
-        channel="gnss",
     )
 
 
@@ -683,7 +681,7 @@ def process_imu_data(session, args, decoded_line: str) -> None:
     keyexp = keelson.construct_pubsub_key(
         base_path=args.realm,
         entity_id=args.entity_id,
-        subject="temperature_celsius",
+        subject="imu_temperature_celsius",
         source_id=channel_source_id(args.source_id, "imu"),
     )
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
