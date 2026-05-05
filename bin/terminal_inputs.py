@@ -109,6 +109,15 @@ def terminal_inputs():
         default="raw_rtcm_v3",
         help="Keelson subject for RTCM corrections. Default: raw_rtcm_v3.",
     )
+    parser.add_argument(
+        "--rtcm-entity-id",
+        type=str,
+        default=None,
+        help=(
+            "Keelson entity-id to subscribe to for RTCM corrections. "
+            "Defaults to --entity-id if not set."
+        ),
+    )
 
     # Parse arguments and start doing our thing
     args = parser.parse_args()
