@@ -1,916 +1,646 @@
 #!/usr/bin/env python3
+"""Ellipse-N Keelson connector with RTCM correction forwarding.
 
-import zenoh
-import logging
-import warnings
+This process reads decoded SBG ASCII log lines from stdin, publishes selected
+messages to Keelson, and optionally subscribes to Keelson RTCM v3 corrections
+and forwards the raw correction bytes ([support.sbg-systems.com](https://support.sbg-systems.com/sc/el/latest/how-to-articles/receive-rtk-corrections-via-ntrip-using-ardusimple))configured on the
+Ellipse for RTCM input.
+
+Expected RTCM Keelson topic shape:
+    <realm>/<entity_id>/raw_rtcm_v3/<rtcm_source_id>
+
+The RTCM payload is expected to be a keelson-enclosed TimestampedBytes message,
+matching the keelson2rtcm connector.
+"""
+
+from __future__ import annotations
+
 import json
+import logging
+import sys
+import time
+import warnings
+from collections import defaultdict
+from datetime import datetime, timezone
+from threading import Lock
+from typing import BinaryIO, Protocol
+
 import keelson
-from terminal_inputs import terminal_inputs
+import zenoh
+from keelson.payloads.Decomposed3DVector_pb2 import Decomposed3DVector
 from keelson.payloads.Primitives_pb2 import (
     TimestampedBytes,
     TimestampedFloat,
+    TimestampedInt,
     TimestampedTimestamp,
     TimestampQuaternion,
-    TimestampedInt
 )
-from keelson.payloads.Decomposed3DVector_pb2 import Decomposed3DVector
 from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
-import sys
-import time
-from datetime import datetime
 from sbg_parser import (
-    parse_nav_line,
-    parse_ship_motion_line,
     parse_air_data_line,
-    parse_utc_time_line,
-    parse_quat_line,
     parse_euler_line,
     parse_gnss_pos_line,
     parse_gnss_vel_line,
     parse_imu_data_line,
-    parse_mag_data_line
+    parse_mag_data_line,
+    parse_nav_line,
+    parse_quat_line,
+    parse_ship_motion_line,
+    parse_utc_time_line,
 )
+from terminal_inputs import terminal_inputs
 
-from datetime import datetime, timezone
-import threading
-from collections import defaultdict
+try:
+    import serial
+except ImportError:  # pragma: no cover - handled at runtime if serial is needed.
+    serial = None
 
-# Global variables for frequency tracking
-message_counts = defaultdict(int)
+
+logger = logging.getLogger("ellipse_n")
+
+message_counts: defaultdict[str, int] = defaultdict(int)
 last_log_time = time.time()
-log_interval = 10.0  # Log frequency every 10 seconds
+LOG_INTERVAL_SECONDS = 10.0
 
-# Other global variables
-session = None
-args = None
-sock = None
-latest_os_message = None
-last_received_time = None
-udp_server_address = None
-deg2rad = lambda x: x * 0.0174533
-g2ms = lambda x: x * 9.80665
+rtcm_output_lock = Lock()
+rtcm_output: RtcmWritable | None = None
 
-def log_data_rates():
-    """Log data rates for all topics at INFO level"""
-    global message_counts, last_log_time
-    
+
+class RtcmWritable(Protocol):
+    """Small protocol for byte sinks used by RTCM forwarding."""
+
+    def write(self, data: bytes) -> int | None:
+        """Write bytes to the sink."""
+
+    def flush(self) -> None:
+        """Flush buffered bytes, if any."""
+
+    def close(self) -> None:
+        """Close the sink."""
+
+
+def log_data_rates() -> None:
+    """Log data rates for all parsed SBG topics."""
+    global last_log_time
+
     current_time = time.time()
     time_diff = current_time - last_log_time
-    
-    if time_diff >= log_interval:
-        if message_counts:
-            rates = []
-            for topic, count in message_counts.items():
-                rate = count / time_diff
-                rates.append(f"{topic}: {rate:.1f} Hz")
-            
-            logging.info(f"Data rates - {', '.join(rates)}")
-            
-        # Reset counters
-        message_counts.clear()
-        last_log_time = current_time
+
+    if time_diff < LOG_INTERVAL_SECONDS:
+        return
+
+    if message_counts:
+        rates = [
+            f"{topic}: {count / time_diff:.1f} Hz"
+            for topic, count in message_counts.items()
+        ]
+        logger.info("Data rates - %s", ", ".join(rates))
+
+    message_counts.clear()
+    last_log_time = current_time
 
 
-if __name__ == "__main__":
-    # Input arguments and configurations
-    args = terminal_inputs()
-    # Setup logger
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)s [%(lineno)d]: %(message)s",
-        level=args.log_level,
+def build_keyexp(args, subject: str, source_id: str | None = None) -> str:
+    """Build a Keelson pub/sub key expression."""
+    return keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject=subject,
+        source_id=args.source_id if source_id is None else source_id,
     )
 
-    logging.captureWarnings(True)
-    warnings.filterwarnings("once")
-    # initiate logging
-    zenoh.init_log_from_env_or("error")
 
-    # Construct session
-    logging.info("Opening Zenoh session...")
+def put_timestamped_float(session, args, subject: str, value: float, timestamp_ns: int) -> None:
+    """Publish a TimestampedFloat payload."""
+    payload = TimestampedFloat()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = value
+
+    keyexp = build_keyexp(args, subject)
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published %s on %s", subject, keyexp)
+
+
+def put_vector(
+    session,
+    args,
+    subject: str,
+    x_value: float,
+    y_value: float,
+    z_value: float,
+    timestamp_ns: int,
+    source_id: str | None = None,
+) -> None:
+    """Publish a Decomposed3DVector payload."""
+    payload = Decomposed3DVector()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+
+    if args.frame_id is not None:
+        payload.frame_id = args.frame_id
+
+    payload.vector.x = x_value
+    payload.vector.y = y_value
+    payload.vector.z = z_value
+
+    keyexp = build_keyexp(args, subject, source_id=source_id)
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published %s on %s", subject, keyexp)
+
+
+def put_location_fix(
+    session,
+    args,
+    subject: str,
+    latitude: float,
+    longitude: float,
+    altitude: float,
+    timestamp_ns: int,
+) -> None:
+    """Publish a LocationFix payload."""
+    payload = LocationFix()
+
+    if args.frame_id is not None:
+        payload.frame_id = args.frame_id
+
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.latitude = latitude
+    payload.longitude = longitude
+    payload.altitude = altitude
+
+    keyexp = build_keyexp(args, subject)
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published %s on %s", subject, keyexp)
+
+
+def open_rtcm_output(args) -> tuple[RtcmWritable, bool]:
+    """Open the RTCM byte sink.
+
+    Supported outputs:
+        - "-" or "stdout": write raw RTCM bytes to stdout.
+        - path with serial mode enabled: open pyserial on that path.
+        - path without serial mode: open as an unbuffered binary file/device.
+
+    The recommended Ellipse setup is serial mode to the Ellipse serial port that
+    has been configured in sbgCenter for RTCM correction input.
+    """
+    output = args.rtcm_output
+
+    if output in {"-", "stdout"}:
+        return sys.stdout.buffer, False
+
+    use_serial = getattr(args, "rtcm_output_serial", True)
+    if use_serial:
+        if serial is None:
+            raise RuntimeError(
+                "pyserial is required for serial RTCM output. "
+                "Install it with `pip install pyserial`, or disable serial mode."
+            )
+
+        baudrate = getattr(args, "rtcm_baudrate", 115200)
+        timeout = getattr(args, "rtcm_serial_timeout", 0)
+        write_timeout = getattr(args, "rtcm_serial_write_timeout", 1)
+
+        stream = serial.Serial(
+            port=output,
+            baudrate=baudrate,
+            timeout=timeout,
+            write_timeout=write_timeout,
+        )
+        return stream, True
+
+    file_stream: BinaryIO = open(output, "ab", buffering=0)
+    return file_stream, True
+
+
+def on_rtcm_sample(sample) -> None:
+    """Extract raw RTCM bytes from Keelson and forward them to the Ellipse."""
+    if rtcm_output is None:
+        logger.warning("Received RTCM sample but no RTCM output is configured")
+        return
+
+    try:
+        _received_at, _enclosed_at, payload_bytes = keelson.uncover(
+            sample.payload.to_bytes()
+        )
+        payload = TimestampedBytes.FromString(payload_bytes)
+
+        if not payload.value:
+            return
+
+        with rtcm_output_lock:
+            rtcm_output.write(payload.value)
+            rtcm_output.flush()
+
+        logger.debug("Forwarded %d RTCM bytes", len(payload.value))
+
+    except BrokenPipeError:
+        logger.exception("RTCM output pipe closed")
+    except Exception:
+        logger.exception("Error processing RTCM sample")
+
+
+def configure_zenoh(args):
+    """Create Zenoh configuration from terminal arguments."""
     conf = zenoh.Config()
 
     if args.mode is not None:
         conf.insert_json5("mode", json.dumps(args.mode))
     if args.connect is not None:
         conf.insert_json5("connect/endpoints", json.dumps(args.connect))
+    if getattr(args, "listen", None) is not None:
+        conf.insert_json5("listen/endpoints", json.dumps(args.listen))
 
+    return conf
+
+
+def setup_rtcm_subscription(session, args):
+    """Set up optional RTCM correction subscription."""
+    global rtcm_output
+
+    if not getattr(args, "enable_rtcm_input", False):
+        return None, False
+
+    rtcm_output, should_close = open_rtcm_output(args)
+    rtcm_subject = getattr(args, "rtcm_subject", "raw_rtcm_v3")
+    rtcm_source_id = getattr(args, "rtcm_source_id", "**")
+
+    keyexp_rtcm = keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject=rtcm_subject,
+        source_id=rtcm_source_id,
+    )
+
+    subscriber = session.declare_subscriber(keyexp_rtcm, on_rtcm_sample)
+    logger.info("Subscribed to RTCM corrections on: %s", keyexp_rtcm)
+    logger.info("Forwarding RTCM corrections to: %s", args.rtcm_output)
+
+    return subscriber, should_close
+
+
+def publish_raw_line(pub_raw, line: bytes) -> None:
+    """Publish one raw SBG input line as TimestampedBytes."""
+    payload = TimestampedBytes()
+    payload.timestamp.FromNanoseconds(time.time_ns())
+    payload.value = line
+    pub_raw.put(keelson.enclose(payload.SerializeToString()))
+
+
+def process_nav(session, args, decoded_line: str) -> None:
+    """Process NAV message."""
+    parsed = parse_nav_line(decoded_line)
+    logger.debug("Parsed navigation data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    put_location_fix(
+        session,
+        args,
+        "INS_location_fix",
+        parsed.lat_degrees,
+        parsed.lon_degrees,
+        parsed.alt_meters,
+        timestamp_ns,
+    )
+    put_vector(
+        session,
+        args,
+        "INS_ned_velocity_mps",
+        parsed.velN_mps,
+        parsed.velE_mps,
+        parsed.velD_mps,
+        timestamp_ns,
+    )
+
+
+def process_ship_motion(session, args, decoded_line: str) -> None:
+    """Process SHIPMOTION message."""
+    parsed = parse_ship_motion_line(decoded_line)
+    logger.debug("Parsed ship motion data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    fields = {
+        "heave_period_sec": parsed.heavePeriod_sec,
+        "surge_m": parsed.surge_m,
+        "sway_m": parsed.sway_m,
+        "heave_m": parsed.heave_m,
+        "surge_acceleration_mpss": parsed.surgeAccel_mps2,
+        "sway_acceleration_mpss": parsed.swayAccel_mps2,
+        "heave_acceleration_mpss": parsed.heaveAccel_mps2,
+        "surge_velocity_mps": parsed.surgeVel_mps,
+        "sway_velocity_mps": parsed.swayVel_mps,
+        "heave_velocity_mps": parsed.heaveVel_mps,
+    }
+
+    for subject, value in fields.items():
+        put_timestamped_float(session, args, subject, value, timestamp_ns)
+
+
+def process_air_data(session, args, decoded_line: str) -> None:
+    """Process AIRDATA message."""
+    parsed = parse_air_data_line(decoded_line)
+    logger.debug("Parsed air data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    put_timestamped_float(
+        session,
+        args,
+        "air_pressure_pa",
+        parsed.pressureAbs_pa,
+        timestamp_ns,
+    )
+    put_timestamped_float(
+        session,
+        args,
+        "altitude_msl_m",
+        parsed.altitude_meters,
+        timestamp_ns,
+    )
+
+
+def process_utc_time(session, args, decoded_line: str) -> None:
+    """Process UTCTIME message."""
+    parsed = parse_utc_time_line(decoded_line)
+    logger.debug("Parsed UTC time data: %s", parsed)
+
+    dt = datetime(
+        year=parsed.gps_year,
+        month=parsed.gps_month,
+        day=parsed.gps_day,
+        hour=parsed.gps_hour,
+        minute=parsed.gps_minute,
+        second=parsed.gps_second,
+        tzinfo=timezone.utc,
+    )
+
+    payload = TimestampedTimestamp()
+    payload.timestamp.FromNanoseconds(time.time_ns())
+    payload.value.FromDatetime(dt)
+
+    keyexp = keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject="timestamp",
+        source_id=f"{args.source_id}/gnss_time",
+    )
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published UTC time data on %s", keyexp)
+
+
+def process_quat(session, args, decoded_line: str) -> None:
+    """Process QUAT message."""
+    parsed = parse_quat_line(decoded_line)
+    logger.debug("Parsed quaternion data: %s", parsed)
+
+    payload = TimestampQuaternion()
+    payload.timestamp.FromNanoseconds(time.time_ns())
+    payload.value.w = parsed.qw
+    payload.value.x = parsed.qx
+    payload.value.y = parsed.qy
+    payload.value.z = parsed.qz
+
+    keyexp = build_keyexp(args, "orientation_quaternion")
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published quaternion data on %s", keyexp)
+
+
+def process_euler(session, args, decoded_line: str) -> None:
+    """Process EULER message."""
+    parsed = parse_euler_line(decoded_line)
+    logger.debug("Parsed Euler angles data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    put_timestamped_float(session, args, "roll_deg", parsed.roll_deg, timestamp_ns)
+    put_timestamped_float(session, args, "pitch_deg", parsed.pitch_deg, timestamp_ns)
+    put_timestamped_float(session, args, "yaw_deg", parsed.yaw_deg, timestamp_ns)
+
+
+def process_gnss_pos(session, args, decoded_line: str) -> None:
+    """Process GNSS1POS message."""
+    parsed = parse_gnss_pos_line(decoded_line)
+    logger.debug("Parsed GNSS position data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    put_location_fix(
+        session,
+        args,
+        "GNSS_location_fix",
+        parsed.lat_deg,
+        parsed.lon_deg,
+        parsed.alt_meters,
+        timestamp_ns,
+    )
+
+    payload = TimestampedInt()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = parsed.numSatellitesUsed
+
+    keyexp = build_keyexp(args, "GNSS_location_fix_satellites_used")
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published GNSS satellites-used data on %s", keyexp)
+
+
+def process_gnss_vel(session, args, decoded_line: str) -> None:
+    """Process GNSS1VEL message."""
+    parsed = parse_gnss_vel_line(decoded_line)
+    logger.debug("Parsed GNSS velocity data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    source_id = f"{args.source_id}/gnss_velocity"
+
+    put_vector(
+        session,
+        args,
+        "GNSS_ned_velocity_mps",
+        parsed.velN_mps,
+        parsed.velE_mps,
+        parsed.velD_mps,
+        timestamp_ns,
+        source_id=source_id,
+    )
+
+    payload = TimestampedFloat()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = parsed.track_deg
+
+    keyexp = keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject="GNSS_course_over_ground_deg",
+        source_id=source_id,
+    )
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published GNSS course over ground data on %s", keyexp)
+
+
+def process_imu_data(session, args, decoded_line: str) -> None:
+    """Process IMUDATA message."""
+    parsed = parse_imu_data_line(decoded_line)
+    logger.debug("Parsed IMU data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+
+    put_vector(
+        session,
+        args,
+        "IMU_linear_acceleration_mpss",
+        parsed.accX_mps2,
+        parsed.accY_mps2,
+        parsed.accZ_mps2,
+        timestamp_ns,
+        source_id=f"{args.source_id}/imu_acceleration",
+    )
+    put_vector(
+        session,
+    keyexp = keelson.construct_pubsub_key(
+        args,
+        "IMU_angular_velocity_radps",
+        parsed.gyroX_radps,
+        parsed.gyroY_radps,
+        parsed.gyroZ_radps,
+        timestamp_ns,
+        source_id=f"{args.source_id}/imu_velocity",
+    )
+
+    payload = TimestampedFloat()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = parsed.temperature_degC
+
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject="IMU_temperature_celsius",
+        source_id=f"{args.source_id}/imu_temperature",
+    )
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published IMU temperature data on %s", keyexp)
+
+
+def process_mag(session, args, decoded_line: str) -> None:
+    """Process MAG message."""
+    parsed = parse_mag_data_line(decoded_line)
+    logger.debug("Parsed magnetometer data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+
+    put_vector(
+        session,
+        args,
+        "magnetic_field_gauss",
+        parsed.magX_au,
+        parsed.magY_au,
+        parsed.magZ_au,
+        timestamp_ns,
+        source_id=f"{args.source_id}/magnetometer",
+    )
+    put_vector(
+        session,
+        args,
+        "MAG_linear_acceleration_mpss",
+        parsed.accelerationX_mps2,
+        parsed.accelerationY_mps2,
+        parsed.accelerationZ_mps2,
+        timestamp_ns,
+        source_id=f"{args.source_id}/magnetometer_acceleration",
+    )
+
+
+def process_decoded_line(session, args, decoded_line: str, raw_line: bytes) -> None:
+    """Route one decoded SBG line to the relevant parser/publisher."""
+    topic = decoded_line.split(":", maxsplit=1)[0].strip()
+    topic_upper = topic.upper()
+    logger.debug("Processing topic: %s", topic_upper)
+
+    message_counts[topic_upper] += 1
+    log_data_rates()
+
+    handlers = {
+        "NAV": process_nav,
+        "SHIPMOTION": process_ship_motion,
+        "AIRDATA": process_air_data,
+        "UTCTIME": process_utc_time,
+        "QUAT": process_quat,
+        "EULER": process_euler,
+        "GNSS1POS": process_gnss_pos,
+        "GNSS1VEL": process_gnss_vel,
+        "IMUDATA": process_imu_data,
+        "MAG": process_mag,
+    }
+
+    handler = handlers.get(topic_upper)
+    if handler is None:
+        if topic_upper != "STATUS":
+            logger.warning("Unknown topic: %s", topic_upper)
+        return
+
+    try:
+        handler(session, args, decoded_line)
+    except Exception:
+        logger.exception("Error parsing %s message. Raw line: %r", topic_upper, raw_line)
+
+
+def main() -> int:
+    """Run the Ellipse-N connector."""
+    args = terminal_inputs()
+
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s [%(lineno)d]: %(message)s",
+        level=args.log_level,
+    )
+    logging.captureWarnings(True)
+    warnings.filterwarnings("once")
+    zenoh.init_log_from_env_or("error")
+
+    conf = configure_zenoh(args)
+
+    logger.info("Opening Zenoh session...")
     with zenoh.open(conf) as session:
+        rtcm_subscriber, should_close_rtcm_output = setup_rtcm_subscription(
+            session,
+            args,
+        )
 
-        #################################################
-        # Setting up Publishers
-
+        pub_raw = None
         if args.publish_raw:
             keyexp_pub_raw = keelson.construct_pubsub_key(
                 base_path=args.realm,
                 entity_id=args.entity_id,
                 subject="raw",
-                source_id=args.source_id + "/utf-8",
+                source_id=f"{args.source_id}/utf-8",
             )
             pub_raw = session.declare_publisher(
                 keyexp_pub_raw,
                 congestion_control=zenoh.CongestionControl.DROP,
                 priority=zenoh.Priority.DEFAULT,
             )
-            logging.info(f"Publishing to: {keyexp_pub_raw}")
+            logger.info("Publishing raw SBG lines to: %s", keyexp_pub_raw)
 
-            logging.info("Reading from stdin...")
-            for line in sys.stdin.buffer:
-                if not line:
+        logger.info("Reading SBG lines from stdin...")
+
+        try:
+            for raw_line in sys.stdin.buffer:
+                if not raw_line:
                     continue
-                # Decode the line to see the SBG data
+
                 try:
-                    decoded_line = line.decode("utf-8", errors="ignore").strip()
-                    logging.debug(f"Received SBG data: {decoded_line}")
+                    decoded_line = raw_line.decode("utf-8", errors="ignore").strip()
+                    logger.debug("Received SBG data: %s", decoded_line)
 
-                    # Publish the raw data
-                    if args.publish_raw:
-                        payload_raw = TimestampedBytes()
-                        payload_raw.timestamp.FromNanoseconds(time.time_ns())
-                        payload_raw.value = line
-                        serialized_payload = payload_raw.SerializeToString()
-                        envelope = keelson.enclose(serialized_payload)
-                        pub_raw.put(envelope)
-                        # logging.debug(f"Published raw data on {keyexp_pub_raw}")
+                    if pub_raw is not None:
+                        publish_raw_line(pub_raw, raw_line)
 
-                    topic = decoded_line.split(":")[0].strip()
-                    topic_upper = topic.upper()
-                    logging.debug(f"Processing topic: {topic_upper}")
-                    
-                    # Track message frequency
-                    message_counts[topic_upper] += 1
-                    log_data_rates()
+                    process_decoded_line(session, args, decoded_line, raw_line)
 
-                    match topic_upper:
+                except Exception:
+                    logger.exception("Error decoding line: %r", raw_line)
 
-                        case "NAV":
-                            # Process navigation data
-                            try:
-                                # Parse the binary data according to SbgEComLogEkfNav structure
-                                parsed_nav = parse_nav_line(decoded_line)
-                                logging.debug(f"Parsed navigation data: {parsed_nav}")
+        finally:
+            if rtcm_subscriber is not None:
+                rtcm_subscriber.undeclare()
 
-                                payload_loc_fix = LocationFix()
-                                if args.frame_id is not None:
-                                    payload_loc_fix.frame_id = args.frame_id
-                                payload_loc_fix.timestamp.FromNanoseconds(
-                                    time.time_ns()
-                                )
-                                payload_loc_fix.latitude = parsed_nav.lat_degrees
-                                payload_loc_fix.longitude = parsed_nav.lon_degrees
-                                payload_loc_fix.altitude = parsed_nav.alt_meters
-                                serialized_payload = payload_loc_fix.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_location_fix = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="INS_location_fix",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_location_fix, envelope)
-                                logging.debug(
-                                    f"Published location fix data on {keyexp_location_fix}"
-                                )
+            if rtcm_output is not None and should_close_rtcm_output:
+                rtcm_output.close()
 
-                                payload_ned = Decomposed3DVector()
-                                payload_ned.timestamp.FromNanoseconds(time.time_ns())
-                                if args.frame_id is not None:
-                                    payload_ned.frame_id = args.frame_id
-                                payload_ned.vector.x = parsed_nav.velN_mps
-                                payload_ned.vector.y = parsed_nav.velE_mps
-                                payload_ned.vector.z = parsed_nav.velD_mps
-                                serialized_payload = payload_ned.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ned = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="INS_ned_velocity_mps",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_ned, envelope)
-                                logging.debug(
-                                    f"Published NED velocity data on {keyexp_ned}"
-                                )
+    return 0
 
-                                # TODO: Add rest of the navigation data processing if needed
 
-                            except Exception as e:
-                                logging.error(f"Error parsing nav message: {e}")
-                                logging.debug(f"Raw nav line: {line}")
-
-                        case "SHIPMOTION":
-                            # Process ship motion data
-                            timestamp_msg = time.time_ns()
-                            try:
-                                # Parse the binary data according to SbgEComLogEkfNav structure
-                                parsed_ship_motion = parse_ship_motion_line(
-                                    decoded_line
-                                )
-                                logging.debug(
-                                    f"Parsed ship motion data: {parsed_ship_motion}"
-                                )
-
-                                # heave_period_s
-                                payload_ship_motion_heave_s = TimestampedFloat()
-                                payload_ship_motion_heave_s.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_heave_s.value = (
-                                    parsed_ship_motion.heavePeriod_sec
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_heave_s.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="heave_period_sec",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_ship_motion, envelope)
-                                logging.debug(
-                                    f"Published ship motion data on {keyexp_ship_motion}"
-                                )
-
-                                # surge_m
-                                payload_ship_motion_surge_m = TimestampedFloat()
-                                payload_ship_motion_surge_m.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_surge_m.value = (
-                                    parsed_ship_motion.surge_m
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_surge_m.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_surge = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="surge_m",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_ship_motion_surge, envelope)
-                                logging.debug(
-                                    f"Published ship motion surge data on {keyexp_ship_motion_surge}"
-                                )
-
-                                # sway_m
-                                payload_ship_motion_sway_m = TimestampedFloat()
-                                payload_ship_motion_sway_m.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_sway_m.value = (
-                                    parsed_ship_motion.sway_m
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_sway_m.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_sway = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="sway_m",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_ship_motion_sway, envelope)
-                                logging.debug(
-                                    f"Published ship motion sway data on {keyexp_ship_motion_sway}"
-                                )
-
-                                # heave_m
-                                payload_ship_motion_heave_m = TimestampedFloat()
-                                payload_ship_motion_heave_m.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_heave_m.value = (
-                                    parsed_ship_motion.heave_m
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_heave_m.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_heave = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="heave_m",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_ship_motion_heave, envelope)
-                                logging.debug(
-                                    f"Published ship motion heave data on {keyexp_ship_motion_heave}"
-                                )
-
-                                # surge_acceleration_mpss
-                                payload_ship_motion_surge_accel_mps2 = (
-                                    TimestampedFloat()
-                                )
-                                payload_ship_motion_surge_accel_mps2.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_surge_accel_mps2.value = (
-                                    parsed_ship_motion.surgeAccel_mps2
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_surge_accel_mps2.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_surge_accel = (
-                                    keelson.construct_pubsub_key(
-                                        base_path=args.realm,
-                                        entity_id=args.entity_id,
-                                        subject="surge_acceleration_mpss",
-                                        source_id=args.source_id,
-                                    )
-                                )
-                                session.put(keyexp_ship_motion_surge_accel, envelope)
-                                logging.debug(
-                                    f"Published ship motion surge acceleration data on {keyexp_ship_motion_surge_accel}"
-                                )
-
-                                # sway_acceleration_mpss
-                                payload_ship_motion_sway_accel_mps2 = TimestampedFloat()
-                                payload_ship_motion_sway_accel_mps2.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_sway_accel_mps2.value = (
-                                    parsed_ship_motion.swayAccel_mps2
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_sway_accel_mps2.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_sway_accel = (
-                                    keelson.construct_pubsub_key(
-                                        base_path=args.realm,
-                                        entity_id=args.entity_id,
-                                        subject="sway_acceleration_mpss",
-                                        source_id=args.source_id,
-                                    )
-                                )
-                                session.put(keyexp_ship_motion_sway_accel, envelope)
-                                logging.debug(
-                                    f"Published ship motion sway acceleration data on {keyexp_ship_motion_sway_accel}"
-                                )
-
-                                # heave_acceleration_mpss
-                                payload_ship_motion_heave_accel_mps2 = (
-                                    TimestampedFloat()
-                                )
-                                payload_ship_motion_heave_accel_mps2.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_heave_accel_mps2.value = (
-                                    parsed_ship_motion.heaveAccel_mps2
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_heave_accel_mps2.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_heave_accel = (
-                                    keelson.construct_pubsub_key(
-                                        base_path=args.realm,
-                                        entity_id=args.entity_id,
-                                        subject="heave_acceleration_mpss",
-                                        source_id=args.source_id,
-                                    )
-                                )
-                                session.put(keyexp_ship_motion_heave_accel, envelope)
-                                logging.debug(
-                                    f"Published ship motion heave acceleration data on {keyexp_ship_motion_heave_accel}"
-                                )
-
-                                # surge_velocity_mps
-                                payload_ship_motion_surge_vel_mps = TimestampedFloat()
-                                payload_ship_motion_surge_vel_mps.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_surge_vel_mps.value = (
-                                    parsed_ship_motion.surgeVel_mps
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_surge_vel_mps.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_surge_vel = (
-                                    keelson.construct_pubsub_key(
-                                        base_path=args.realm,
-                                        entity_id=args.entity_id,
-                                        subject="surge_velocity_mps",
-                                        source_id=args.source_id,
-                                    )
-                                )
-                                session.put(keyexp_ship_motion_surge_vel, envelope)
-                                logging.debug(
-                                    f"Published ship motion surge velocity data on {keyexp_ship_motion_surge_vel}"
-                                )
-
-                                # sway_velocity_mps
-                                payload_ship_motion_sway_vel_mps = TimestampedFloat()
-                                payload_ship_motion_sway_vel_mps.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_sway_vel_mps.value = (
-                                    parsed_ship_motion.swayVel_mps
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_sway_vel_mps.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_sway_vel = (
-                                    keelson.construct_pubsub_key(
-                                        base_path=args.realm,
-                                        entity_id=args.entity_id,
-                                        subject="sway_velocity_mps",
-                                        source_id=args.source_id,
-                                    )
-                                )
-                                session.put(keyexp_ship_motion_sway_vel, envelope)
-                                logging.debug(
-                                    f"Published ship motion sway velocity data on {keyexp_ship_motion_sway_vel}"
-                                )
-
-                                # heave_velocity_mps
-                                payload_ship_motion_heave_vel_mps = TimestampedFloat()
-                                payload_ship_motion_heave_vel_mps.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_ship_motion_heave_vel_mps.value = (
-                                    parsed_ship_motion.heaveVel_mps
-                                )
-                                serialized_payload = (
-                                    payload_ship_motion_heave_vel_mps.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_ship_motion_heave_vel = (
-                                    keelson.construct_pubsub_key(
-                                        base_path=args.realm,
-                                        entity_id=args.entity_id,
-                                        subject="heave_velocity_mps",
-                                        source_id=args.source_id,
-                                    )
-                                )
-                                session.put(keyexp_ship_motion_heave_vel, envelope)
-                                logging.debug(
-                                    f"Published ship motion heave velocity data on {keyexp_ship_motion_heave_vel}"
-                                )
-
-                            except Exception as e:
-                                logging.error(f"Error parsing ship motion message: {e}")
-                                logging.debug(f"Raw ship motion line: {line}")
-
-                        case "STATUS":
-                            # Process status data
-                            try:
-                                # TODO: Implement status data processing if needed
-                                pass
-                            except Exception as e:
-                                logging.error(f"Error parsing status message: {e}")
-                                logging.debug(f"Raw status line: {line}")
-
-                        case "AIRDATA":
-                            # Process air data
-                            timestamp_msg = time.time_ns()
-                            try:
-                                parsed_air_data = parse_air_data_line(decoded_line)
-                                logging.debug(f"Parsed air data: {parsed_air_data}")
-
-                                # air_pressure_pa
-                                payload_air_pressure_pa = TimestampedFloat()
-                                payload_air_pressure_pa.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_air_pressure_pa.value = (
-                                    parsed_air_data.pressureAbs_pa
-                                )
-                                serialized_payload = (
-                                    payload_air_pressure_pa.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_air_pressure = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="air_pressure_pa",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_air_pressure, envelope)
-                                logging.debug(
-                                    f"Published air pressure data on {keyexp_air_pressure}"
-                                )
-
-                                # altitude_msl_m
-                                payload_air_altitude_msl_m = TimestampedFloat()
-                                payload_air_altitude_msl_m.timestamp.FromNanoseconds(
-                                    timestamp_msg
-                                )
-                                payload_air_altitude_msl_m.value = (
-                                    parsed_air_data.altitude_meters
-                                )
-                                serialized_payload = (
-                                    payload_air_altitude_msl_m.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_air_altitude = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="altitude_msl_m",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_air_altitude, envelope)
-                                logging.debug(
-                                    f"Published air altitude data on {keyexp_air_altitude}"
-                                )
-
-                            except Exception as e:
-                                logging.error(f"Error parsing air data message: {e}")
-                                logging.debug(f"Raw air data line: {line}")
-
-                        case "UTCTIME":
-                            # Process UTC time data
-                            try:
-                                parsed_utc_time = parse_utc_time_line(decoded_line)
-                                logging.debug(
-                                    f"Parsed UTC time data: {parsed_utc_time}"
-                                )
-
-                                # Create a datetime object from the parsed UTC time
-                                dt = datetime(
-                                    year=parsed_utc_time.gps_year,
-                                    month=parsed_utc_time.gps_month,
-                                    day=parsed_utc_time.gps_day,
-                                    hour=parsed_utc_time.gps_hour,
-                                    minute=parsed_utc_time.gps_minute,
-                                    second=parsed_utc_time.gps_second,
-                                    tzinfo=timezone.utc,
-                                )
-
-                                # Calculate seconds and nanoseconds since Unix epoch
-                                seconds_since_epoch = int(dt.timestamp())
-                                nanoseconds = parsed_utc_time.gps_nanosecond
-
-                                # Create Protobuf Timestamp
-                                payload_utc_time = TimestampedTimestamp()
-                                payload_utc_time.timestamp.FromNanoseconds(
-                                    time.time_ns()
-                                )
-                                payload_utc_time.value.FromDatetime(dt)
-                                serialized_payload = (
-                                    payload_utc_time.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_utc_time = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="timestamp",
-                                    source_id=args.source_id + "/gnss_time",
-                                )
-                                session.put(keyexp_utc_time, envelope)
-                                logging.debug(
-                                    f"Published UTC time data on {keyexp_utc_time}"
-                                )
-
-                            except Exception as e:
-                                logging.error(f"Error parsing UTC time message: {e}")
-                                logging.debug(f"Raw UTC time line: {line}")
-
-                        case "QUAT":
-                            # Process quaternion data
-                            try:
-                                # Parse the quaternion data
-                                parsed_quat = parse_quat_line(decoded_line)
-                                logging.debug(f"Parsed quaternion data: {parsed_quat}")
-
-                                # orientation_quaternion
-                                payload_quat = TimestampQuaternion()
-                                payload_quat.timestamp.FromNanoseconds(time.time_ns())
-                                payload_quat.value.w = parsed_quat.qw
-                                payload_quat.value.x = parsed_quat.qx
-                                payload_quat.value.y = parsed_quat.qy
-                                payload_quat.value.z = parsed_quat.qz
-                                serialized_payload = payload_quat.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_quat = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="orientation_quaternion",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_quat, envelope)
-                                logging.debug(
-                                    f"Published quaternion data on {keyexp_quat}"
-                                )
-
-                            except Exception as e:
-                                logging.error(f"Error parsing quaternion message: {e}")
-                                logging.debug(f"Raw quaternion line: {line}")
-
-                        case "EULER":
-                            # Process Euler angles data
-
-                            try:
-                                timestamp_msg = time.time_ns()
-                                # Parse the Euler angles data
-                                parsed_euler = parse_euler_line(decoded_line)
-                                logging.debug(
-                                    f"Parsed Euler angles data: {parsed_euler}"
-                                )
-
-                                # roll_deg
-                                payload_euler = TimestampedFloat()
-                                payload_euler.timestamp.FromNanoseconds(timestamp_msg)
-                                payload_euler.value = parsed_euler.roll_deg
-                                serialized_payload = payload_euler.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_euler = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="roll_deg",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_euler, envelope)
-                                logging.debug(
-                                    f"Published Euler angles roll data on {keyexp_euler}"
-                                )
-
-                                # pitch_deg
-                                payload_euler = TimestampedFloat()
-                                payload_euler.timestamp.FromNanoseconds(timestamp_msg)
-                                payload_euler.value = parsed_euler.pitch_deg
-                                serialized_payload = payload_euler.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_euler_pitch = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="pitch_deg",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_euler_pitch, envelope)
-                                logging.debug(
-                                    f"Published Euler angles pitch data on {keyexp_euler_pitch}"
-                                )
-
-                                # yaw_deg
-                                payload_euler = TimestampedFloat()
-                                payload_euler.timestamp.FromNanoseconds(timestamp_msg)
-                                payload_euler.value = parsed_euler.yaw_deg
-                                serialized_payload = payload_euler.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_euler_yaw = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="yaw_deg",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_euler_yaw, envelope)
-                                logging.debug(
-                                    f"Published Euler angles yaw data on {keyexp_euler_yaw}"
-                                )
-
-                            except Exception as e:
-                                logging.error(
-                                    f"Error parsing Euler angles message: {e}"
-                                )
-                                logging.debug(f"Raw Euler angles line: {line}")
-
-                        case "GNSS1POS":
-                            # Process GNSS position data
-                            try:
-                                # Parse the GNSS position data
-                                parsed_gnss_pos = parse_gnss_pos_line(decoded_line)
-                                logging.debug(f"Parsed GNSS position data: {parsed_gnss_pos}")
-
-                                # location_fix
-                                payload_loc_fix = LocationFix()
-                                if args.frame_id is not None:
-                                    payload_loc_fix.frame_id = args.frame_id
-                                payload_loc_fix.timestamp.FromNanoseconds(
-                                    time.time_ns()
-                                )
-                                payload_loc_fix.latitude = parsed_gnss_pos.lat_deg
-                                payload_loc_fix.longitude = parsed_gnss_pos.lon_deg
-                                payload_loc_fix.altitude = parsed_gnss_pos.alt_meters
-                                serialized_payload = payload_loc_fix.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_gnss_loc = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="GNSS_location_fix",
-                                    source_id=args.source_id,
-                                )
-                                session.put(keyexp_gnss_loc, envelope)
-                                logging.debug(
-                                    f"Published GNSS location fix data on {keyexp_gnss_loc}"
-                                )
-
-                                # location_fix_satellites_used
-                                payload_loc_fix_satellites_used = TimestampedInt()
-                                payload_loc_fix_satellites_used.timestamp.FromNanoseconds(
-                                    time.time_ns()
-                                )
-                                payload_loc_fix_satellites_used.value = (
-                                    parsed_gnss_pos.numSatellitesUsed
-                                )
-                                serialized_payload = (
-                                    payload_loc_fix_satellites_used.SerializeToString()
-                                )
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_loc_fix_satellites_used = (
-                                    keelson.construct_pubsub_key(
-                                        base_path=args.realm,
-                                        entity_id=args.entity_id,
-                                        subject="GNSS_location_fix_satellites_used",
-                                        source_id=args.source_id,
-                                    )
-                                )
-
-                            except Exception as e:
-                                logging.error(
-                                    f"Error parsing GNSS position message: {e}"
-                                )
-                                logging.debug(f"Raw GNSS position line: {line}")
-
-                        case "GNSS1VEL":
-                            # Handle GNSS1VEL message
-                            try:
-                                # TODO: Implement GNSS velocity data processing
-                                parsed_gnss_vel = parse_gnss_vel_line(decoded_line)
-                                logging.debug(f"Parsed GNSS velocity data: {parsed_gnss_vel}")
-                                
-                                # ned_velocity_mps
-                                payload_gnss_vel = Decomposed3DVector()
-                                payload_gnss_vel.timestamp.FromNanoseconds(time.time_ns())
-                                if args.frame_id is not None:
-                                    payload_gnss_vel.frame_id = args.frame_id
-                                payload_gnss_vel.vector.x = parsed_gnss_vel.velN_mps
-                                payload_gnss_vel.vector.y = parsed_gnss_vel.velE_mps
-                                payload_gnss_vel.vector.z = parsed_gnss_vel.velD_mps
-                                serialized_payload = payload_gnss_vel.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_gnss_vel = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="GNSS_ned_velocity_mps",
-                                    source_id=args.source_id + "/gnss_velocity",
-                                )
-                                session.put(keyexp_gnss_vel, envelope)
-                                logging.debug(
-                                    f"Published GNSS velocity data on {keyexp_gnss_vel}"
-                                )
-
-                                # course_over_ground_deg
-                                payload_gnss_course = TimestampedFloat()
-                                payload_gnss_course.timestamp.FromNanoseconds(
-                                    time.time_ns()
-                                )
-                                payload_gnss_course.value = parsed_gnss_vel.track_deg
-                                serialized_payload = payload_gnss_course.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_gnss_course = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="GNSS_course_over_ground_deg",
-                                    source_id=args.source_id + "/gnss_velocity",
-                                )
-                                session.put(keyexp_gnss_course, envelope)
-                                logging.debug(
-                                    f"Published GNSS course over ground data on {keyexp_gnss_course}"
-                                )
-
-                            except Exception as e:
-                                logging.error(f"Error parsing GNSS velocity message: {e}")
-                                logging.debug(f"Raw GNSS velocity line: {line}")
-                        
-                        case "IMUDATA":
-                            # Process IMU data
-                            try:
-
-                                timestamp_msg = time.time_ns()
-                                parsed_imu_data = parse_imu_data_line(decoded_line)
-                                logging.debug(f"Parsed IMU data: {parsed_imu_data}")
-
-                                # linear_acceleration_mpss
-                                payload_imu_acc = Decomposed3DVector()
-                                payload_imu_acc.timestamp.FromNanoseconds(timestamp_msg)
-                                if args.frame_id is not None:
-                                    payload_imu_acc.frame_id = args.frame_id
-                                payload_imu_acc.vector.x = parsed_imu_data.accX_mps2
-                                payload_imu_acc.vector.y = parsed_imu_data.accY_mps2
-                                payload_imu_acc.vector.z = parsed_imu_data.accZ_mps2
-                                serialized_payload = payload_imu_acc.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_imu_acc = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="IMU_linear_acceleration_mpss",
-                                    source_id=args.source_id + "/imu_acceleration",
-                                )
-                                session.put(keyexp_imu_acc, envelope)
-                                logging.debug(
-                                    f"Published IMU linear acceleration data on {keyexp_imu_acc}"
-                                )
-
-                                # angular_velocity_radps
-                                payload_imu_vel = Decomposed3DVector()
-                                payload_imu_vel.timestamp.FromNanoseconds(timestamp_msg)
-                                if args.frame_id is not None:
-                                    payload_imu_vel.frame_id = args.frame_id
-                                payload_imu_vel.vector.x = parsed_imu_data.gyroX_radps
-                                payload_imu_vel.vector.y = parsed_imu_data.gyroY_radps
-                                payload_imu_vel.vector.z = parsed_imu_data.gyroZ_radps
-                                serialized_payload = payload_imu_vel.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_imu_vel = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="IMU_angular_velocity_radps",
-                                    source_id=args.source_id + "/imu_velocity",
-                                )
-                                session.put(keyexp_imu_vel, envelope)
-                                logging.debug(
-                                    f"Published IMU angular velocity data on {keyexp_imu_vel}"
-                                )
-
-                                # imu_temperature_celsius
-                                payload_imu_temp = TimestampedFloat()
-                                payload_imu_temp.timestamp.FromNanoseconds(timestamp_msg)
-                                payload_imu_temp.value = parsed_imu_data.temperature_degC
-                                serialized_payload = payload_imu_temp.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_imu_temp = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="IMU_temperature_celsius",
-                                    source_id=args.source_id + "/imu_temperature",
-                                )
-                                session.put(keyexp_imu_temp, envelope)
-                                logging.debug(
-                                    f"Published IMU temperature data on {keyexp_imu_temp}"
-                                )
-
-                            except Exception as e:
-                                logging.error(f"Error parsing IMU data message: {e}")
-                                logging.debug(f"Raw IMU data line: {line}")
-                                
-                        case "MAG":
-                            # Process magnetometer data
-                            try:
-                                timestamp_msg = time.time_ns()
-                                parsed_mag_data = parse_mag_data_line(decoded_line)
-                                logging.debug(f"Parsed magnetometer data: {parsed_mag_data}")
-
-                                # magnetic_field_gauss
-                                payload_mag = Decomposed3DVector()
-                                payload_mag.timestamp.FromNanoseconds(timestamp_msg)
-                                if args.frame_id is not None:
-                                    payload_mag.frame_id = args.frame_id
-                                payload_mag.vector.x = parsed_mag_data.magX_au
-                                payload_mag.vector.y = parsed_mag_data.magY_au
-                                payload_mag.vector.z = parsed_mag_data.magZ_au
-                                serialized_payload = payload_mag.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_mag = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="magnetic_field_gauss",
-                                    source_id=args.source_id + "/magnetometer",
-                                )
-                                session.put(keyexp_mag, envelope)
-                                logging.debug(
-                                    f"Published magnetometer data on {keyexp_mag}"
-                                )
-
-                                # linear_acceleration_mpss
-                                payload_mag_acc = Decomposed3DVector()
-                                payload_mag_acc.timestamp.FromNanoseconds(timestamp_msg)
-                                if args.frame_id is not None:
-                                    payload_mag_acc.frame_id = args.frame_id
-                                payload_mag_acc.vector.x = parsed_mag_data.accelerationX_mps2
-                                payload_mag_acc.vector.y = parsed_mag_data.accelerationY_mps2
-                                payload_mag_acc.vector.z = parsed_mag_data.accelerationZ_mps2
-                                serialized_payload = payload_mag_acc.SerializeToString()
-                                envelope = keelson.enclose(serialized_payload)
-                                keyexp_mag_acc = keelson.construct_pubsub_key(
-                                    base_path=args.realm,
-                                    entity_id=args.entity_id,
-                                    subject="MAG_linear_acceleration_mpss",
-                                    source_id=args.source_id + "/magnetometer_acceleration",
-                                )
-                                session.put(keyexp_mag_acc, envelope)
-                                logging.debug(
-                                    f"Published magnetometer acceleration data on {keyexp_mag_acc}"
-                                )
-                            
-                            except Exception as e:
-                                logging.error(f"Error parsing magnetometer message: {e}")
-                                logging.debug(f"Raw magnetometer line: {line}")
-
-                        # Topic not recognized
-                        case _:
-                            logging.warning(f"Unknown topic: {topic_upper}")
-
-                except Exception as e:
-                    logging.error(f"Error decoding line: {e}")
-                    logging.debug(f"Raw line: {line}")
-
-         
-        
+if __name__ == "__main__":
+    raise SystemExit(main())
