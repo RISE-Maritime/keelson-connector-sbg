@@ -103,6 +103,12 @@ def terminal_inputs():
             "or a device/file path such as /dev/ttyUSB0."
         ),
     )
+    parser.add_argument(
+        "--rtcm-subject",
+        type=str,
+        default="raw_rtcm_v3",
+        help="Keelson subject for RTCM corrections. Default: raw_rtcm_v3.",
+    )
 
     # Parse arguments and start doing our thing
     args = parser.parse_args()
