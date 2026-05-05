@@ -8,6 +8,769 @@ Ellipse for RTCM input.
 
 Expected RTCM Keelson topic shape:
     <realm>/<entity_id>/raw_rtcm_v3/<rtcm_source_id>
+#!/usr/bin/env python3
+"""Ellipse-N Keelson connector with RTCM correction forwarding.
+
+This process reads decoded SBG ASCII log lines from stdin, publishes selected
+messages to Keelson, and optionally subscribes to Keelson RTCM v3 corrections
+and forwards the raw correction bytes ([support.sbg-systems.com](https://support.sbg-systems.com/sc/el/latest/how-to-articles/receive-rtk-corrections-via-ntrip-using-ardusimple))configured on the
+Ellipse for RTCM input.
+
+Expected RTCM Keelson topic shape:
+    <realm>/<entity_id>/raw_rtcm_v3/<rtcm_source_id>
+
+The RTCM payload is expected to be a keelson-enclosed TimestampedBytes message,
+matching the keelson2rtcm connector.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+import time
+import warnings
+from collections import defaultdict
+from datetime import datetime, timezone
+from threading import Lock
+from typing import BinaryIO, Protocol
+
+import keelson
+import zenoh
+from keelson.payloads.Decomposed3DVector_pb2 import Decomposed3DVector
+from keelson.payloads.Primitives_pb2 import (
+    TimestampedBytes,
+    TimestampedFloat,
+    TimestampedInt,
+    TimestampedTimestamp,
+    TimestampQuaternion,
+)
+from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
+from sbg_parser import (
+    parse_air_data_line,
+    parse_euler_line,
+    parse_gnss_pos_line,
+    parse_gnss_vel_line,
+    parse_imu_data_line,
+    parse_mag_data_line,
+    parse_nav_line,
+    parse_quat_line,
+    parse_ship_motion_line,
+    parse_utc_time_line,
+)
+from terminal_inputs import terminal_inputs
+
+try:
+    import serial
+except ImportError:  # pragma: no cover - handled at runtime if serial is needed.
+    serial = None
+
+
+logger = logging.getLogger("ellipse_n")
+
+SBG_GNSS_STATUS_MASK = 0x3F
+SBG_GNSS_TYPE_SHIFT = 6
+SBG_GNSS_TYPE_MASK = 0x3F
+
+SBG_POS_TYPE_NO_SOLUTION = 0
+SBG_POS_TYPE_UNKNOWN = 1
+SBG_POS_TYPE_SINGLE = 2
+SBG_POS_TYPE_PSRDIFF = 3
+SBG_POS_TYPE_SBAS = 4
+SBG_POS_TYPE_OMNISTAR = 5
+SBG_POS_TYPE_RTK_FLOAT = 6
+SBG_POS_TYPE_RTK_INT = 7
+SBG_POS_TYPE_PPP_FLOAT = 8
+SBG_POS_TYPE_PPP_INT = 9
+SBG_POS_TYPE_FIXED = 10
+
+RTK_STATUS_UNKNOWN = 0
+RTK_STATUS_NONE = 1
+RTK_STATUS_DIFFERENTIAL = 2
+RTK_STATUS_FLOAT = 3
+RTK_STATUS_FIXED = 4
+
+message_counts: defaultdict[str, int] = defaultdict(int)
+last_log_time = time.time()
+LOG_INTERVAL_SECONDS = 10.0
+
+rtcm_output_lock = Lock()
+rtcm_output: RtcmWritable | None = None
+
+
+class RtcmWritable(Protocol):
+    """Small protocol for byte sinks used by RTCM forwarding."""
+
+    def write(self, data: bytes) -> int | None:
+        """Write bytes to the sink."""
+
+    def flush(self) -> None:
+        """Flush buffered bytes, if any."""
+
+    def close(self) -> None:
+        """Close the sink."""
+
+
+def log_data_rates() -> None:
+    """Log data rates for all parsed SBG topics."""
+    global last_log_time
+
+    current_time = time.time()
+    time_diff = current_time - last_log_time
+
+    if time_diff < LOG_INTERVAL_SECONDS:
+        return
+
+    if message_counts:
+        rates = [
+            f"{topic}: {count / time_diff:.1f} Hz"
+            for topic, count in message_counts.items()
+        ]
+        logger.info("Data rates - %s", ", ".join(rates))
+
+    message_counts.clear()
+    last_log_time = current_time
+
+
+def build_keyexp(args, subject: str, source_id: str | None = None) -> str:
+    """Build a Keelson pub/sub key expression."""
+    return keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject=subject,
+        source_id=args.source_id if source_id is None else source_id,
+    )
+
+
+def put_timestamped_float(
+    session,
+    args,
+    subject: str,
+    value: float,
+    timestamp_ns: int,
+    source_id: str | None = None,
+) -> None:
+    """Publish a TimestampedFloat payload."""
+    payload = TimestampedFloat()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = value
+
+    keyexp = build_keyexp(args, subject, source_id=source_id)
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published %s on %s", subject, keyexp)
+
+
+def put_timestamped_int(
+    session,
+    args,
+    subject: str,
+    value: int,
+    timestamp_ns: int,
+    source_id: str | None = None,
+) -> None:
+    """Publish a TimestampedInt payload."""
+    payload = TimestampedInt()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = value
+
+    keyexp = build_keyexp(args, subject, source_id=source_id)
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published %s on %s", subject, keyexp)
+
+
+def put_vector(
+    session,
+    args,
+    subject: str,
+    x_value: float,
+    y_value: float,
+    z_value: float,
+    timestamp_ns: int,
+    source_id: str | None = None,
+) -> None:
+    """Publish a Decomposed3DVector payload."""
+    payload = Decomposed3DVector()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+
+    if args.frame_id is not None:
+        payload.frame_id = args.frame_id
+
+    payload.vector.x = x_value
+    payload.vector.y = y_value
+    payload.vector.z = z_value
+
+    keyexp = build_keyexp(args, subject, source_id=source_id)
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published %s on %s", subject, keyexp)
+
+
+def put_location_fix(
+    session,
+    args,
+    subject: str,
+    latitude: float,
+    longitude: float,
+    altitude: float,
+    timestamp_ns: int,
+) -> None:
+    """Publish a LocationFix payload."""
+    payload = LocationFix()
+
+    if args.frame_id is not None:
+        payload.frame_id = args.frame_id
+
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.latitude = latitude
+    payload.longitude = longitude
+    payload.altitude = altitude
+
+    keyexp = build_keyexp(args, subject)
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published %s on %s", subject, keyexp)
+
+
+def parse_sbg_int(value: str | int | float) -> int:
+    """Parse SBG numeric fields that may arrive as strings or floats."""
+    return int(float(value))
+
+
+def decode_gnss_position_status(status_type: str | int | float) -> tuple[int, int]:
+    """Decode SBG GNSS position STATUS_TYPE into status and type enums."""
+    raw_status = parse_sbg_int(status_type)
+    position_status = raw_status & SBG_GNSS_STATUS_MASK
+    position_type = (raw_status >> SBG_GNSS_TYPE_SHIFT) & SBG_GNSS_TYPE_MASK
+    return position_status, position_type
+
+
+def position_type_to_rtk_status(position_type: int) -> int:
+    """Convert SBG GNSS position type enum to a compact RTK status enum.
+
+    Published RTK status values:
+        0: unknown
+        1: no RTK / no differential correction solution
+        2: differential correction solution, but not RTK
+        3: RTK float
+        4: RTK fixed / integer ambiguity solution
+    """
+    if position_type == SBG_POS_TYPE_RTK_FLOAT:
+        return RTK_STATUS_FLOAT
+    if position_type == SBG_POS_TYPE_RTK_INT:
+        return RTK_STATUS_FIXED
+    if position_type in {
+        SBG_POS_TYPE_PSRDIFF,
+        SBG_POS_TYPE_SBAS,
+        SBG_POS_TYPE_OMNISTAR,
+        SBG_POS_TYPE_PPP_FLOAT,
+        SBG_POS_TYPE_PPP_INT,
+    }:
+        return RTK_STATUS_DIFFERENTIAL
+    if position_type in {
+        SBG_POS_TYPE_NO_SOLUTION,
+        SBG_POS_TYPE_SINGLE,
+        SBG_POS_TYPE_FIXED,
+    }:
+        return RTK_STATUS_NONE
+    return RTK_STATUS_UNKNOWN
+
+
+def open_rtcm_output(args) -> tuple[RtcmWritable, bool]:
+    """Open the RTCM byte sink.
+
+    Supported outputs:
+        - "-" or "stdout": write raw RTCM bytes to stdout.
+        - path with serial mode enabled: open pyserial on that path.
+        - path without serial mode: open as an unbuffered binary file/device.
+
+    The recommended Ellipse setup is serial mode to the Ellipse serial port that
+    has been configured in sbgCenter for RTCM correction input.
+    """
+    output = args.rtcm_output
+
+    if output in {"-", "stdout"}:
+        return sys.stdout.buffer, False
+
+    use_serial = getattr(args, "rtcm_output_serial", True)
+    if use_serial:
+        if serial is None:
+            raise RuntimeError(
+                "pyserial is required for serial RTCM output. "
+                "Install it with `pip install pyserial`, or disable serial mode."
+            )
+
+        baudrate = getattr(args, "rtcm_baudrate", 115200)
+        timeout = getattr(args, "rtcm_serial_timeout", 0)
+        write_timeout = getattr(args, "rtcm_serial_write_timeout", 1)
+
+        stream = serial.Serial(
+            port=output,
+            baudrate=baudrate,
+            timeout=timeout,
+            write_timeout=write_timeout,
+        )
+        return stream, True
+
+    file_stream: BinaryIO = open(output, "ab", buffering=0)
+    return file_stream, True
+
+
+def on_rtcm_sample(sample) -> None:
+    """Extract raw RTCM bytes from Keelson and forward them to the Ellipse."""
+    if rtcm_output is None:
+        logger.warning("Received RTCM sample but no RTCM output is configured")
+        return
+
+    try:
+        _received_at, _enclosed_at, payload_bytes = keelson.uncover(
+            sample.payload.to_bytes()
+        )
+        payload = TimestampedBytes.FromString(payload_bytes)
+
+        if not payload.value:
+            return
+
+        with rtcm_output_lock:
+            rtcm_output.write(payload.value)
+            rtcm_output.flush()
+
+        logger.debug("Forwarded %d RTCM bytes", len(payload.value))
+
+    except BrokenPipeError:
+        logger.exception("RTCM output pipe closed")
+    except Exception:
+        logger.exception("Error processing RTCM sample")
+
+
+def configure_zenoh(args):
+    """Create Zenoh configuration from terminal arguments."""
+    conf = zenoh.Config()
+
+    if args.mode is not None:
+        conf.insert_json5("mode", json.dumps(args.mode))
+    if args.connect is not None:
+        conf.insert_json5("connect/endpoints", json.dumps(args.connect))
+    if getattr(args, "listen", None) is not None:
+        conf.insert_json5("listen/endpoints", json.dumps(args.listen))
+
+    return conf
+
+
+def setup_rtcm_subscription(session, args):
+    """Set up optional RTCM correction subscription."""
+    global rtcm_output
+
+    if not getattr(args, "enable_rtcm_input", False):
+        return None, False
+
+    rtcm_output, should_close = open_rtcm_output(args)
+    rtcm_subject = getattr(args, "rtcm_subject", "raw_rtcm_v3")
+    rtcm_source_id = getattr(args, "rtcm_source_id", "**")
+
+    keyexp_rtcm = keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject=rtcm_subject,
+        source_id=rtcm_source_id,
+    )
+
+    subscriber = session.declare_subscriber(keyexp_rtcm, on_rtcm_sample)
+    logger.info("Subscribed to RTCM corrections on: %s", keyexp_rtcm)
+    logger.info("Forwarding RTCM corrections to: %s", args.rtcm_output)
+
+    return subscriber, should_close
+
+
+def publish_raw_line(pub_raw, line: bytes) -> None:
+    """Publish one raw SBG input line as TimestampedBytes."""
+    payload = TimestampedBytes()
+    payload.timestamp.FromNanoseconds(time.time_ns())
+    payload.value = line
+    pub_raw.put(keelson.enclose(payload.SerializeToString()))
+
+
+def process_nav(session, args, decoded_line: str) -> None:
+    """Process NAV message."""
+    parsed = parse_nav_line(decoded_line)
+    logger.debug("Parsed navigation data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    put_location_fix(
+        session,
+        args,
+        "INS_location_fix",
+        parsed.lat_degrees,
+        parsed.lon_degrees,
+        parsed.alt_meters,
+        timestamp_ns,
+    )
+    put_vector(
+        session,
+        args,
+        "INS_ned_velocity_mps",
+        parsed.velN_mps,
+        parsed.velE_mps,
+        parsed.velD_mps,
+        timestamp_ns,
+    )
+
+
+def process_ship_motion(session, args, decoded_line: str) -> None:
+    """Process SHIPMOTION message."""
+    parsed = parse_ship_motion_line(decoded_line)
+    logger.debug("Parsed ship motion data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    fields = {
+        "heave_period_sec": parsed.heavePeriod_sec,
+        "surge_m": parsed.surge_m,
+        "sway_m": parsed.sway_m,
+        "heave_m": parsed.heave_m,
+        "surge_acceleration_mpss": parsed.surgeAccel_mps2,
+        "sway_acceleration_mpss": parsed.swayAccel_mps2,
+        "heave_acceleration_mpss": parsed.heaveAccel_mps2,
+        "surge_velocity_mps": parsed.surgeVel_mps,
+        "sway_velocity_mps": parsed.swayVel_mps,
+        "heave_velocity_mps": parsed.heaveVel_mps,
+    }
+
+    for subject, value in fields.items():
+        put_timestamped_float(session, args, subject, value, timestamp_ns)
+
+
+def process_air_data(session, args, decoded_line: str) -> None:
+    """Process AIRDATA message."""
+    parsed = parse_air_data_line(decoded_line)
+    logger.debug("Parsed air data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    put_timestamped_float(
+        session,
+        args,
+        "air_pressure_pa",
+        parsed.pressureAbs_pa,
+        timestamp_ns,
+    )
+    put_timestamped_float(
+        session,
+        args,
+        "altitude_msl_m",
+        parsed.altitude_meters,
+        timestamp_ns,
+    )
+
+
+def process_utc_time(session, args, decoded_line: str) -> None:
+    """Process UTCTIME message."""
+    parsed = parse_utc_time_line(decoded_line)
+    logger.debug("Parsed UTC time data: %s", parsed)
+
+    dt = datetime(
+        year=parsed.gps_year,
+        month=parsed.gps_month,
+        day=parsed.gps_day,
+        hour=parsed.gps_hour,
+        minute=parsed.gps_minute,
+        second=parsed.gps_second,
+        tzinfo=timezone.utc,
+    )
+
+    payload = TimestampedTimestamp()
+    payload.timestamp.FromNanoseconds(time.time_ns())
+    payload.value.FromDatetime(dt)
+
+    keyexp = keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject="timestamp",
+        source_id=f"{args.source_id}/gnss_time",
+    )
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published UTC time data on %s", keyexp)
+
+
+def process_quat(session, args, decoded_line: str) -> None:
+    """Process QUAT message."""
+    parsed = parse_quat_line(decoded_line)
+    logger.debug("Parsed quaternion data: %s", parsed)
+
+    payload = TimestampQuaternion()
+    payload.timestamp.FromNanoseconds(time.time_ns())
+    payload.value.w = parsed.qw
+    payload.value.x = parsed.qx
+    payload.value.y = parsed.qy
+    payload.value.z = parsed.qz
+
+    keyexp = build_keyexp(args, "orientation_quaternion")
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published quaternion data on %s", keyexp)
+
+
+def process_euler(session, args, decoded_line: str) -> None:
+    """Process EULER message."""
+    parsed = parse_euler_line(decoded_line)
+    logger.debug("Parsed Euler angles data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    put_timestamped_float(session, args, "roll_deg", parsed.roll_deg, timestamp_ns)
+    put_timestamped_float(session, args, "pitch_deg", parsed.pitch_deg, timestamp_ns)
+    put_timestamped_float(session, args, "yaw_deg", parsed.yaw_deg, timestamp_ns)
+
+
+def process_gnss_pos(session, args, decoded_line: str) -> None:
+    """Process GNSS1POS message."""
+    parsed = parse_gnss_pos_line(decoded_line)
+    logger.debug("Parsed GNSS position data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    raw_status = parse_sbg_int(parsed.status)
+    raw_status_ext = parse_sbg_int(parsed.statusExt)
+    position_status, position_type = decode_gnss_position_status(raw_status)
+    rtk_status = position_type_to_rtk_status(position_type)
+    diff_age_seconds = parse_sbg_int(parsed.diffAge) * 0.01
+
+    put_location_fix(
+        session,
+        args,
+        "GNSS_location_fix",
+        parsed.lat_deg,
+        parsed.lon_deg,
+        parsed.alt_meters,
+        timestamp_ns,
+    )
+
+    int_fields = {
+        "GNSS_location_fix_satellites_tracked": parsed.satellites_tracked,
+        "GNSS_location_fix_satellites_used": parsed.numSatellitesUsed,
+        "GNSS_position_status_raw": raw_status,
+        "GNSS_position_status": position_status,
+        "GNSS_position_type": position_type,
+        "GNSS_rtk_status": rtk_status,
+        "GNSS_position_status_ext_raw": raw_status_ext,
+        "GNSS_base_station_id": parsed.baseStationId,
+    }
+
+    for subject, value in int_fields.items():
+        put_timestamped_int(
+            session,
+            args,
+            subject,
+            parse_sbg_int(value),
+            timestamp_ns,
+        )
+
+    put_timestamped_float(
+        session,
+        args,
+        "GNSS_differential_age_sec",
+        diff_age_seconds,
+        timestamp_ns,
+    )
+
+
+def process_gnss_vel(session, args, decoded_line: str) -> None:
+    """Process GNSS1VEL message."""
+    parsed = parse_gnss_vel_line(decoded_line)
+    logger.debug("Parsed GNSS velocity data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+    source_id = f"{args.source_id}/gnss_velocity"
+
+    put_vector(
+        session,
+        args,
+        "GNSS_ned_velocity_mps",
+        parsed.velN_mps,
+        parsed.velE_mps,
+        parsed.velD_mps,
+        timestamp_ns,
+        source_id=source_id,
+    )
+
+    payload = TimestampedFloat()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = parsed.track_deg
+
+    keyexp = keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject="GNSS_course_over_ground_deg",
+        source_id=source_id,
+    )
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published GNSS course over ground data on %s", keyexp)
+
+
+def process_imu_data(session, args, decoded_line: str) -> None:
+    """Process IMUDATA message."""
+    parsed = parse_imu_data_line(decoded_line)
+    logger.debug("Parsed IMU data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+
+    put_vector(
+        session,
+        args,
+        "IMU_linear_acceleration_mpss",
+        parsed.accX_mps2,
+        parsed.accY_mps2,
+        parsed.accZ_mps2,
+        timestamp_ns,
+        source_id=f"{args.source_id}/imu_acceleration",
+    )
+    put_vector(
+        session,
+        args,
+        "IMU_angular_velocity_radps",
+        parsed.gyroX_radps,
+        parsed.gyroY_radps,
+        parsed.gyroZ_radps,
+        timestamp_ns,
+        source_id=f"{args.source_id}/imu_velocity",
+    )
+
+    payload = TimestampedFloat()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    payload.value = parsed.temperature_degC
+
+    keyexp = keelson.construct_pubsub_key(
+        base_path=args.realm,
+        entity_id=args.entity_id,
+        subject="IMU_temperature_celsius",
+        source_id=f"{args.source_id}/imu_temperature",
+    )
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+    logger.debug("Published IMU temperature data on %s", keyexp)
+
+
+def process_mag(session, args, decoded_line: str) -> None:
+    """Process MAG message."""
+    parsed = parse_mag_data_line(decoded_line)
+    logger.debug("Parsed magnetometer data: %s", parsed)
+
+    timestamp_ns = time.time_ns()
+
+    put_vector(
+        session,
+        args,
+        "magnetic_field_gauss",
+        parsed.magX_au,
+        parsed.magY_au,
+        parsed.magZ_au,
+        timestamp_ns,
+        source_id=f"{args.source_id}/magnetometer",
+    )
+    put_vector(
+        session,
+        args,
+        "MAG_linear_acceleration_mpss",
+        parsed.accelerationX_mps2,
+        parsed.accelerationY_mps2,
+        parsed.accelerationZ_mps2,
+        timestamp_ns,
+        source_id=f"{args.source_id}/magnetometer_acceleration",
+    )
+
+
+def process_decoded_line(session, args, decoded_line: str, raw_line: bytes) -> None:
+    """Route one decoded SBG line to the relevant parser/publisher."""
+    topic = decoded_line.split(":", maxsplit=1)[0].strip()
+    topic_upper = topic.upper()
+    logger.debug("Processing topic: %s", topic_upper)
+
+    message_counts[topic_upper] += 1
+    log_data_rates()
+
+    handlers = {
+        "NAV": process_nav,
+        "SHIPMOTION": process_ship_motion,
+        "AIRDATA": process_air_data,
+        "UTCTIME": process_utc_time,
+        "QUAT": process_quat,
+        "EULER": process_euler,
+        "GNSS1POS": process_gnss_pos,
+        "GNSS1VEL": process_gnss_vel,
+        "IMUDATA": process_imu_data,
+        "MAG": process_mag,
+    }
+
+    handler = handlers.get(topic_upper)
+    if handler is None:
+        if topic_upper != "STATUS":
+            logger.warning("Unknown topic: %s", topic_upper)
+        return
+
+    try:
+        handler(session, args, decoded_line)
+    except Exception:
+        logger.exception("Error parsing %s message. Raw line: %r", topic_upper, raw_line)
+
+
+def main() -> int:
+    """Run the Ellipse-N connector."""
+    args = terminal_inputs()
+
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s [%(lineno)d]: %(message)s",
+        level=args.log_level,
+    )
+    logging.captureWarnings(True)
+    warnings.filterwarnings("once")
+    zenoh.init_log_from_env_or("error")
+
+    conf = configure_zenoh(args)
+
+    logger.info("Opening Zenoh session...")
+    with zenoh.open(conf) as session:
+        rtcm_subscriber, should_close_rtcm_output = setup_rtcm_subscription(
+            session,
+            args,
+        )
+
+        pub_raw = None
+        if args.publish_raw:
+            keyexp_pub_raw = keelson.construct_pubsub_key(
+                base_path=args.realm,
+                entity_id=args.entity_id,
+                subject="raw",
+                source_id=f"{args.source_id}/utf-8",
+            )
+            pub_raw = session.declare_publisher(
+                keyexp_pub_raw,
+                congestion_control=zenoh.CongestionControl.DROP,
+                priority=zenoh.Priority.DEFAULT,
+            )
+            logger.info("Publishing raw SBG lines to: %s", keyexp_pub_raw)
+
+        logger.info("Reading SBG lines from stdin...")
+
+        try:
+            for raw_line in sys.stdin.buffer:
+                if not raw_line:
+                    continue
+
+                try:
+                    decoded_line = raw_line.decode("utf-8", errors="ignore").strip()
+                    logger.debug("Received SBG data: %s", decoded_line)
+
+                    if pub_raw is not None:
+                        publish_raw_line(pub_raw, raw_line)
+
+                    process_decoded_line(session, args, decoded_line, raw_line)
+
+                except Exception:
+                    logger.exception("Error decoding line: %r", raw_line)
+
+        finally:
+            if rtcm_subscriber is not None:
+                rtcm_subscriber.undeclare()
+
+            if rtcm_output is not None and should_close_rtcm_output:
+                rtcm_output.close()
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 The RTCM payload is expected to be a keelson-enclosed TimestampedBytes message,
 matching the keelson2rtcm connector.
