@@ -7,7 +7,7 @@ and forwards the raw correction bytes ([support.sbg-systems.com](https://support
 Ellipse for RTCM input.
 
 Expected RTCM Keelson topic shape:
-    <realm>/<rtcm-entity_id>/raw_rtcm_v3/<rtcm_source_id>
+    <realm>/<entity_id>/raw_rtcm_v3/<rtcm_source_id>
 
 The RTCM payload is expected to be a keelson-enclosed TimestampedBytes message,
 matching the keelson2rtcm connector.
@@ -122,13 +122,40 @@ def log_data_rates() -> None:
     last_log_time = current_time
 
 
-def build_keyexp(args, subject: str, source_id: str | None = None) -> str:
+def channel_source_id(base_source_id: str, channel: str | None = None) -> str:
+    """Insert a sensor channel after the leading 'sbg' source component.
+
+    Examples:
+        sbg/0 + ins -> sbg/ins/0
+        sbg/0 + gnss -> sbg/gnss/0
+        foo/0 + ins -> foo/ins/0
+    """
+    if channel is None:
+        return base_source_id
+
+    parts = base_source_id.split("/")
+    if len(parts) <= 1:
+        return f"{base_source_id}/{channel}"
+
+    return "/".join([parts[0], channel, *parts[1:]])
+
+
+def build_keyexp(
+    args,
+    subject: str,
+    source_id: str | None = None,
+    channel: str | None = None,
+) -> str:
     """Build a Keelson pub/sub key expression."""
+    resolved_source_id = source_id
+    if resolved_source_id is None:
+        resolved_source_id = channel_source_id(args.source_id, channel)
+
     return keelson.construct_pubsub_key(
         base_path=args.realm,
         entity_id=args.entity_id,
         subject=subject,
-        source_id=args.source_id if source_id is None else source_id,
+        source_id=resolved_source_id,
     )
 
 
@@ -139,13 +166,14 @@ def put_timestamped_float(
     value: float,
     timestamp_ns: int,
     source_id: str | None = None,
+    channel: str | None = None,
 ) -> None:
     """Publish a TimestampedFloat payload."""
     payload = TimestampedFloat()
     payload.timestamp.FromNanoseconds(timestamp_ns)
     payload.value = value
 
-    keyexp = build_keyexp(args, subject, source_id=source_id)
+    keyexp = build_keyexp(args, subject, source_id=source_id, channel=channel)
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
     logger.debug("Published %s on %s", subject, keyexp)
 
@@ -157,13 +185,14 @@ def put_timestamped_int(
     value: int,
     timestamp_ns: int,
     source_id: str | None = None,
+    channel: str | None = None,
 ) -> None:
     """Publish a TimestampedInt payload."""
     payload = TimestampedInt()
     payload.timestamp.FromNanoseconds(timestamp_ns)
     payload.value = value
 
-    keyexp = build_keyexp(args, subject, source_id=source_id)
+    keyexp = build_keyexp(args, subject, source_id=source_id, channel=channel)
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
     logger.debug("Published %s on %s", subject, keyexp)
 
@@ -177,6 +206,7 @@ def put_vector(
     z_value: float,
     timestamp_ns: int,
     source_id: str | None = None,
+    channel: str | None = None,
 ) -> None:
     """Publish a Decomposed3DVector payload."""
     payload = Decomposed3DVector()
@@ -189,7 +219,7 @@ def put_vector(
     payload.vector.y = y_value
     payload.vector.z = z_value
 
-    keyexp = build_keyexp(args, subject, source_id=source_id)
+    keyexp = build_keyexp(args, subject, source_id=source_id, channel=channel)
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
     logger.debug("Published %s on %s", subject, keyexp)
 
@@ -202,6 +232,7 @@ def put_location_fix(
     longitude: float,
     altitude: float,
     timestamp_ns: int,
+    channel: str | None = None,
 ) -> None:
     """Publish a LocationFix payload."""
     payload = LocationFix()
@@ -214,7 +245,7 @@ def put_location_fix(
     payload.longitude = longitude
     payload.altitude = altitude
 
-    keyexp = build_keyexp(args, subject)
+    keyexp = build_keyexp(args, subject, channel=channel)
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
     logger.debug("Published %s on %s", subject, keyexp)
 
@@ -355,11 +386,9 @@ def setup_rtcm_subscription(session, args):
     rtcm_subject = getattr(args, "rtcm_subject", "raw_rtcm_v3")
     rtcm_source_id = getattr(args, "rtcm_source_id", "**")
 
-    rtcm_entity_id = getattr(args, "rtcm_entity_id", None) or args.entity_id
-
     keyexp_rtcm = keelson.construct_pubsub_key(
         base_path=args.realm,
-        entity_id=rtcm_entity_id,
+        entity_id=args.entity_id,
         subject=rtcm_subject,
         source_id=rtcm_source_id,
     )
@@ -388,20 +417,22 @@ def process_nav(session, args, decoded_line: str) -> None:
     put_location_fix(
         session,
         args,
-        "INS_location_fix",
+        "location_fix",
         parsed.lat_degrees,
         parsed.lon_degrees,
         parsed.alt_meters,
         timestamp_ns,
+        channel="ins",
     )
     put_vector(
         session,
         args,
-        "INS_ned_velocity_mps",
+        "ned_velocity_mps",
         parsed.velN_mps,
         parsed.velE_mps,
         parsed.velD_mps,
         timestamp_ns,
+        channel="ins",
     )
 
 
@@ -425,7 +456,7 @@ def process_ship_motion(session, args, decoded_line: str) -> None:
     }
 
     for subject, value in fields.items():
-        put_timestamped_float(session, args, subject, value, timestamp_ns)
+        put_timestamped_float(session, args, subject, value, timestamp_ns, channel="ship_motion")
 
 
 def process_air_data(session, args, decoded_line: str) -> None:
@@ -440,6 +471,7 @@ def process_air_data(session, args, decoded_line: str) -> None:
         "air_pressure_pa",
         parsed.pressureAbs_pa,
         timestamp_ns,
+        channel="air",
     )
     put_timestamped_float(
         session,
@@ -447,6 +479,7 @@ def process_air_data(session, args, decoded_line: str) -> None:
         "altitude_msl_m",
         parsed.altitude_meters,
         timestamp_ns,
+        channel="air",
     )
 
 
@@ -473,7 +506,7 @@ def process_utc_time(session, args, decoded_line: str) -> None:
         base_path=args.realm,
         entity_id=args.entity_id,
         subject="timestamp",
-        source_id=f"{args.source_id}/gnss_time",
+        source_id=channel_source_id(args.source_id, "gnss"),
     )
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
     logger.debug("Published UTC time data on %s", keyexp)
@@ -491,7 +524,7 @@ def process_quat(session, args, decoded_line: str) -> None:
     payload.value.y = parsed.qy
     payload.value.z = parsed.qz
 
-    keyexp = build_keyexp(args, "orientation_quaternion")
+    keyexp = build_keyexp(args, "orientation_quaternion", channel="ins")
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
     logger.debug("Published quaternion data on %s", keyexp)
 
@@ -502,9 +535,30 @@ def process_euler(session, args, decoded_line: str) -> None:
     logger.debug("Parsed Euler angles data: %s", parsed)
 
     timestamp_ns = time.time_ns()
-    put_timestamped_float(session, args, "roll_deg", parsed.roll_deg, timestamp_ns)
-    put_timestamped_float(session, args, "pitch_deg", parsed.pitch_deg, timestamp_ns)
-    put_timestamped_float(session, args, "yaw_deg", parsed.yaw_deg, timestamp_ns)
+    put_timestamped_float(
+        session,
+        args,
+        "roll_deg",
+        parsed.roll_deg,
+        timestamp_ns,
+        channel="ins",
+    )
+    put_timestamped_float(
+        session,
+        args,
+        "pitch_deg",
+        parsed.pitch_deg,
+        timestamp_ns,
+        channel="ins",
+    )
+    put_timestamped_float(
+        session,
+        args,
+        "yaw_deg",
+        parsed.yaw_deg,
+        timestamp_ns,
+        channel="ins",
+    )
 
 
 def process_gnss_pos(session, args, decoded_line: str) -> None:
@@ -522,22 +576,23 @@ def process_gnss_pos(session, args, decoded_line: str) -> None:
     put_location_fix(
         session,
         args,
-        "GNSS_location_fix",
+        "location_fix",
         parsed.lat_deg,
         parsed.lon_deg,
         parsed.alt_meters,
         timestamp_ns,
+        channel="gnss",
     )
 
     int_fields = {
-        "GNSS_location_fix_satellites_tracked": parsed.satellites_tracked,
-        "GNSS_location_fix_satellites_used": parsed.numSatellitesUsed,
-        "GNSS_position_status_raw": raw_status,
-        "GNSS_position_status": position_status,
-        "GNSS_position_type": position_type,
-        "GNSS_rtk_status": rtk_status,
-        "GNSS_position_status_ext_raw": raw_status_ext,
-        "GNSS_base_station_id": parsed.baseStationId,
+        "location_fix_satellites_tracked": parsed.satellites_tracked,
+        "location_fix_satellites_used": parsed.numSatellitesUsed,
+        "position_status_raw": raw_status,
+        "position_status": position_status,
+        "position_type": position_type,
+        "rtk_status": rtk_status,
+        "position_status_ext_raw": raw_status_ext,
+        "base_station_id": parsed.baseStationId,
     }
 
     for subject, value in int_fields.items():
@@ -547,14 +602,16 @@ def process_gnss_pos(session, args, decoded_line: str) -> None:
             subject,
             parse_sbg_int(value),
             timestamp_ns,
+            channel="gnss",
         )
 
     put_timestamped_float(
         session,
         args,
-        "GNSS_differential_age_sec",
+        "differential_age_sec",
         diff_age_seconds,
         timestamp_ns,
+        channel="gnss",
     )
 
 
@@ -564,12 +621,12 @@ def process_gnss_vel(session, args, decoded_line: str) -> None:
     logger.debug("Parsed GNSS velocity data: %s", parsed)
 
     timestamp_ns = time.time_ns()
-    source_id = f"{args.source_id}/gnss_velocity"
+    source_id = channel_source_id(args.source_id, "gnss")
 
     put_vector(
         session,
         args,
-        "GNSS_ned_velocity_mps",
+        "ned_velocity_mps",
         parsed.velN_mps,
         parsed.velE_mps,
         parsed.velD_mps,
@@ -584,7 +641,7 @@ def process_gnss_vel(session, args, decoded_line: str) -> None:
     keyexp = keelson.construct_pubsub_key(
         base_path=args.realm,
         entity_id=args.entity_id,
-        subject="GNSS_course_over_ground_deg",
+        subject="course_over_ground_deg",
         source_id=source_id,
     )
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
@@ -601,22 +658,22 @@ def process_imu_data(session, args, decoded_line: str) -> None:
     put_vector(
         session,
         args,
-        "IMU_linear_acceleration_mpss",
+        "linear_acceleration_mpss",
         parsed.accX_mps2,
         parsed.accY_mps2,
         parsed.accZ_mps2,
         timestamp_ns,
-        source_id=f"{args.source_id}/imu_acceleration",
+        channel="imu",
     )
     put_vector(
         session,
         args,
-        "IMU_angular_velocity_radps",
+        "angular_velocity_radps",
         parsed.gyroX_radps,
         parsed.gyroY_radps,
         parsed.gyroZ_radps,
         timestamp_ns,
-        source_id=f"{args.source_id}/imu_velocity",
+        channel="imu",
     )
 
     payload = TimestampedFloat()
@@ -626,8 +683,8 @@ def process_imu_data(session, args, decoded_line: str) -> None:
     keyexp = keelson.construct_pubsub_key(
         base_path=args.realm,
         entity_id=args.entity_id,
-        subject="IMU_temperature_celsius",
-        source_id=f"{args.source_id}/imu_temperature",
+        subject="temperature_celsius",
+        source_id=channel_source_id(args.source_id, "imu"),
     )
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
     logger.debug("Published IMU temperature data on %s", keyexp)
@@ -648,17 +705,17 @@ def process_mag(session, args, decoded_line: str) -> None:
         parsed.magY_au,
         parsed.magZ_au,
         timestamp_ns,
-        source_id=f"{args.source_id}/magnetometer",
+        channel="magnetometer",
     )
     put_vector(
         session,
         args,
-        "MAG_linear_acceleration_mpss",
+        "linear_acceleration_mpss",
         parsed.accelerationX_mps2,
         parsed.accelerationY_mps2,
         parsed.accelerationZ_mps2,
         timestamp_ns,
-        source_id=f"{args.source_id}/magnetometer_acceleration",
+        channel="magnetometer",
     )
 
 
