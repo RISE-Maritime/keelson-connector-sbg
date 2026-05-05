@@ -81,6 +81,29 @@ def terminal_inputs():
         help="Publish location fix that includes position and altitude",
     )
 
+    parser.add_argument(
+        "--enable-rtcm-input",
+        action="store_true",
+        help="Subscribe to RTCM v3 corrections from Keelson and forward them to the SBG.",
+    )
+
+    parser.add_argument(
+        "--rtcm-source-id",
+        type=str,
+        default="**",
+        help="Keelson source-id for RTCM corrections. Default: **.",
+    )
+
+    parser.add_argument(
+        "--rtcm-output",
+        type=str,
+        default="-",
+        help=(
+            "Where to write raw RTCM bytes. Use '-' or 'stdout' for stdout, "
+            "or a device/file path such as /dev/ttyUSB0."
+        ),
+    )
+
     # Parse arguments and start doing our thing
     args = parser.parse_args()
 
