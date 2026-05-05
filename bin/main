@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-"""Ellipse-N Keelson connector with RTCM correction forwarding.
-
-This process reads decoded SBG ASCII log lines from stdin, publishes selected
-messages to Keelson, and optionally subscribes to Keelson RTCM v3 corrections
-and forwards the raw correction bytes ([support.sbg-systems.com](https://support.sbg-systems.com/sc/el/latest/how-to-articles/receive-rtk-corrections-via-ntrip-using-ardusimple))configured on the
-Ellipse for RTCM input.
-
-Expected RTCM Keelson topic shape:
-    <realm>/<entity_id>/raw_rtcm_v3/<rtcm_source_id>
-#!/usr/bin/env python3
-"""Ellipse-N Keelson connector with RTCM correction forwarding.
-
-This process reads decoded SBG ASCII log lines from stdin, publishes selected
-messages to Keelson, and optionally subscribes to Keelson RTCM v3 corrections
-and forwards the raw correction bytes ([support.sbg-systems.com](https://support.sbg-systems.com/sc/el/latest/how-to-articles/receive-rtk-corrections-via-ntrip-using-ardusimple))configured on the
-Ellipse for RTCM input.
-
-Expected RTCM Keelson topic shape:
-    <realm>/<entity_id>/raw_rtcm_v3/<rtcm_source_id>
-
-The RTCM payload is expected to be a keelson-enclosed TimestampedBytes message,
-matching the keelson2rtcm connector.
-"""
 
 from __future__ import annotations
 
