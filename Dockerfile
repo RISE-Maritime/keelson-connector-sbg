@@ -1,9 +1,7 @@
-FROM ubuntu:22.04
+FROM python:3.11-slim-bookworm
 
-# Set environment
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies and runtime requirements
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -11,15 +9,13 @@ RUN apt-get update && apt-get install -y \
     wget \
     unzip \
     libusb-1.0-0-dev \
-    python3 \
-    python3-pip \
+    bash \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python requirements
 COPY requirements.txt requirements.txt
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip && \
+    python -m pip install --no-cache-dir -r requirements.txt
 
-# Clone and build SBG SDK
 WORKDIR /opt
 RUN git clone https://github.com/SBG-Systems/sbgECom.git
 
@@ -30,14 +26,15 @@ RUN cmake -Bbuild -DBUILD_EXAMPLES=ON -DBUILD_TOOLS=ON && \
     cp build/sbgBasicLogger /usr/local/bin/sbgBasicLogger && \
     chmod +x /usr/local/bin/sbgBasicLogger
 
-# Copy user-provided binaries
 COPY --chmod=555 ./bin/* /usr/local/bin/
 
 WORKDIR /app
 
-# Create a wrapper script to pipe sbgBasicLogger output to Python script
-RUN echo '#!/bin/bash\nsbgBasicLogger "$@" | python3 /usr/local/bin/main ${PYTHON_ARGS:-}' > /usr/local/bin/sbg-connector.sh && \
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    'sbgBasicLogger "$@" | python /usr/local/bin/main ${PYTHON_ARGS:-}' \
+    > /usr/local/bin/sbg-connector.sh && \
     chmod +x /usr/local/bin/sbg-connector.sh
 
-# Use the wrapper script as entrypoint
 ENTRYPOINT ["/usr/local/bin/sbg-connector.sh"]
