@@ -33,7 +33,7 @@ from keelson.payloads.Primitives_pb2 import (
     TimestampedFloat,
     TimestampedInt,
     TimestampedTimestamp,
-    TimestampQuaternion,
+    TimestampedQuaternion,
 )
 from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
 from sbg_parser import (
@@ -517,7 +517,7 @@ def process_quat(session, args, decoded_line: str) -> None:
     parsed = parse_quat_line(decoded_line)
     logger.debug("Parsed quaternion data: %s", parsed)
 
-    payload = TimestampQuaternion()
+    payload = TimestampedQuaternion()
     payload.timestamp.FromNanoseconds(time.time_ns())
     payload.value.w = parsed.qw
     payload.value.x = parsed.qx
