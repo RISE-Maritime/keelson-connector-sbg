@@ -634,6 +634,18 @@ def process_gnss_vel(session, args, decoded_line: str) -> None:
         source_id=source_id,
     )
 
+    speed_over_ground_mps = ( parsed.velN_mps**2 + parsed.velE_mps**2 ) ** 0.5
+    speed_over_ground_knots = speed_over_ground_mps * 1.9438444924406046
+
+    put_timestamped_float(
+        session,
+        args,
+        "speed_over_ground_knots",
+        speed_over_ground_knots,
+        timestamp_ns,
+        source_id=source_id,
+    )
+
     payload = TimestampedFloat()
     payload.timestamp.FromNanoseconds(timestamp_ns)
     payload.value = parsed.track_deg
