@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 import warnings
 from collections import defaultdict
 from datetime import datetime, timezone
 from threading import Lock
+from types import SimpleNamespace
 from typing import BinaryIO, Protocol
 
 import keelson
@@ -39,7 +41,7 @@ from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
 from sbg_parser import (
     parse_air_data_line,
     parse_euler_line,
-    parse_gnss_pos_line,
+    parse_gnss_pos_line as parse_gnss_pos_line_from_parser,
     parse_gnss_vel_line,
     parse_imu_data_line,
     parse_mag_data_line,
@@ -80,12 +82,21 @@ RTK_STATUS_DIFFERENTIAL = 2
 RTK_STATUS_FLOAT = 3
 RTK_STATUS_FIXED = 4
 
+MPS_TO_KNOTS = 1.9438444924406046
+INVALID_U16 = 0xFFFF
+INVALID_U32 = 0xFFFFFFFF
+
 message_counts: defaultdict[str, int] = defaultdict(int)
 last_log_time = time.time()
 LOG_INTERVAL_SECONDS = 10.0
 
 rtcm_output_lock = Lock()
 rtcm_output: RtcmWritable | None = None
+rtcm_samples_forwarded = 0
+rtcm_bytes_forwarded = 0
+last_rtcm_log_time = 0.0
+last_rtcm_received_time = 0.0
+last_gnss_diagnostics: tuple[int, int, int, int, int] | None = None
 
 
 class RtcmWritable(Protocol):
@@ -294,6 +305,137 @@ def position_type_to_rtk_status(position_type: int) -> int:
     return RTK_STATUS_UNKNOWN
 
 
+
+def position_type_label(position_type: int) -> str:
+    """Return a readable SBG GNSS position type label."""
+    labels = {
+        SBG_POS_TYPE_NO_SOLUTION: "no_solution",
+        SBG_POS_TYPE_UNKNOWN: "unknown",
+        SBG_POS_TYPE_SINGLE: "single",
+        SBG_POS_TYPE_PSRDIFF: "psrdiff_dgps",
+        SBG_POS_TYPE_SBAS: "sbas",
+        SBG_POS_TYPE_OMNISTAR: "omnistar",
+        SBG_POS_TYPE_RTK_FLOAT: "rtk_float",
+        SBG_POS_TYPE_RTK_INT: "rtk_fixed",
+        SBG_POS_TYPE_PPP_FLOAT: "ppp_float",
+        SBG_POS_TYPE_PPP_INT: "ppp_fixed",
+        SBG_POS_TYPE_FIXED: "fixed_location",
+    }
+    return labels.get(position_type, f"unmapped_{position_type}")
+
+
+def rtk_status_label(rtk_status: int) -> str:
+    """Return a readable compact RTK/GNSS aiding status label."""
+    labels = {
+        RTK_STATUS_UNKNOWN: "unknown",
+        RTK_STATUS_NONE: "none",
+        RTK_STATUS_DIFFERENTIAL: "differential_non_rtk",
+        RTK_STATUS_FLOAT: "rtk_float",
+        RTK_STATUS_FIXED: "rtk_fixed",
+    }
+    return labels.get(rtk_status, f"unmapped_{rtk_status}")
+
+
+def parse_gnss_pos_line(decoded_line: str):
+    """Parse SBG GNSS1POS text output with 14/16-field variants.
+
+    The external sbg_parser version used by older deployments expects one
+    specific layout and can fail on the current 16-field `gnss1Pos` output.
+    This wrapper first tries that parser, then falls back to a tolerant parser
+    for the current SBG ASCII log format.
+    """
+    try:
+        return parse_gnss_pos_line_from_parser(decoded_line)
+    except ValueError:
+        logger.debug("Falling back to local GNSS1POS parser for: %s", decoded_line)
+
+    normalized_line = re.sub(r"(\d)([-+])", r"\1 \2", decoded_line)
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?"
+        r"|[-+]?\d+(?:[eE][-+]?\d+)?"
+        r"|nan",
+        normalized_line,
+    )
+
+    # Some historical SBG text formats inserted one leading numeric token before
+    # the actual STATUS field. Current `gnss1Pos : ...` output does not.
+    if len(tokens) in {15, 17}:
+        tokens = tokens[1:]
+
+    if len(tokens) not in {14, 16}:
+        raise ValueError(
+            "Expected 14 or 16 numeric GNSS1POS fields, "
+            f"found {len(tokens)}, tokens: {tokens}"
+        )
+
+    def parse_float(value: str) -> float:
+        return float("nan") if value == "nan" else float(value)
+
+    extra_status_1 = int(float(tokens[14])) if len(tokens) == 16 else 0
+    extra_status_2 = int(float(tokens[15])) if len(tokens) == 16 else 0
+
+    return SimpleNamespace(
+        status=tokens[0],
+        statusExt=tokens[1],
+        gpsTow_ms=int(float(tokens[2])),
+        lat_deg=parse_float(tokens[3]),
+        lon_deg=parse_float(tokens[4]),
+        alt_meters=parse_float(tokens[5]),
+        undulation_meters=parse_float(tokens[6]),
+        lat_std_meters=parse_float(tokens[7]),
+        lon_std_meters=parse_float(tokens[8]),
+        alt_std_meters=parse_float(tokens[9]),
+        satellites_tracked=int(float(tokens[10])),
+        numSatellitesUsed=int(float(tokens[11])),
+        baseStationId=int(float(tokens[12])),
+        diffAge=int(float(tokens[13])),
+        extra_status_1=extra_status_1,
+        extra_status_2=extra_status_2,
+    )
+
+
+def is_invalid_sbg_u16(value: str | int | float) -> bool:
+    """Return True if an SBG unsigned-16 field is set to its invalid sentinel."""
+    return parse_sbg_int(value) == INVALID_U16
+
+
+def is_invalid_sbg_u32(value: str | int | float) -> bool:
+    """Return True if an SBG unsigned-32 field is set to its invalid sentinel."""
+    return parse_sbg_int(value) == INVALID_U32
+
+
+def log_rtcm_forwarding(payload_bytes: bytes) -> None:
+    """Periodically log RTCM forwarding diagnostics."""
+    global last_rtcm_log_time, last_rtcm_received_time
+    global rtcm_bytes_forwarded, rtcm_samples_forwarded
+
+    now = time.time()
+    last_rtcm_received_time = now
+    rtcm_samples_forwarded += 1
+    rtcm_bytes_forwarded += len(payload_bytes)
+
+    if payload_bytes and payload_bytes[0] != 0xD3:
+        logger.warning(
+            "RTCM payload does not start with RTCM3 preamble 0xD3; "
+            "first_bytes=%s length=%d",
+            payload_bytes[:8].hex(" "),
+            len(payload_bytes),
+        )
+
+    if now - last_rtcm_log_time < 10.0:
+        return
+
+    logger.info(
+        "RTCM forwarding active: samples=%d bytes=%d last_payload_bytes=%d "
+        "first_bytes=%s",
+        rtcm_samples_forwarded,
+        rtcm_bytes_forwarded,
+        len(payload_bytes),
+        payload_bytes[:8].hex(" "),
+    )
+    last_rtcm_log_time = now
+
+
 def open_rtcm_output(args) -> tuple[RtcmWritable, bool]:
     """Open the RTCM byte sink.
 
@@ -353,6 +495,7 @@ def on_rtcm_sample(sample) -> None:
             rtcm_output.write(payload.value)
             rtcm_output.flush()
 
+        log_rtcm_forwarding(payload.value)
         logger.debug("Forwarded %d RTCM bytes", len(payload.value))
 
     except BrokenPipeError:
@@ -396,7 +539,13 @@ def setup_rtcm_subscription(session, args):
     )
 
     subscriber = session.declare_subscriber(keyexp_rtcm, on_rtcm_sample)
-    logger.info("Subscribed to RTCM corrections on: %s", keyexp_rtcm)
+    logger.info(
+        "Subscribed to RTCM corrections on: %s "
+        "(rtcm_entity_id=%s, rtcm_source_id=%s)",
+        keyexp_rtcm,
+        rtcm_entity_id,
+        rtcm_source_id,
+    )
     logger.info("Forwarding RTCM corrections to: %s", args.rtcm_output)
 
     return subscriber, should_close
@@ -565,6 +714,8 @@ def process_euler(session, args, decoded_line: str) -> None:
 
 def process_gnss_pos(session, args, decoded_line: str) -> None:
     """Process GNSS1POS message."""
+    global last_gnss_diagnostics
+
     parsed = parse_gnss_pos_line(decoded_line)
     logger.debug("Parsed GNSS position data: %s", parsed)
 
@@ -602,16 +753,62 @@ def process_gnss_pos(session, args, decoded_line: str) -> None:
             channel="gnss",
         )
 
-    logger.debug(
-        "GNSS diagnostics: raw_status=%s, status_ext=%s, "
-        "position_status=%s, position_type=%s, base_station_id=%s, "
-        "diff_age_seconds=%.2f",
+    diagnostics = (
         raw_status,
         raw_status_ext,
         position_status,
         position_type,
+        rtk_status,
+    )
+    if diagnostics != last_gnss_diagnostics:
+        logger.info(
+            "GNSS status changed: raw_status=%s, status_ext=%s, "
+            "position_status=%s, position_type=%s/%s, "
+            "gnss_aiding_status=%s/%s, satellites_visible=%s, "
+            "satellites_used=%s, base_station_id=%s, diff_age_seconds=%.2f",
+            raw_status,
+            raw_status_ext,
+            position_status,
+            position_type,
+            position_type_label(position_type),
+            rtk_status,
+            rtk_status_label(rtk_status),
+            parsed.satellites_tracked,
+            parsed.numSatellitesUsed,
+            parsed.baseStationId,
+            diff_age_seconds,
+        )
+        last_gnss_diagnostics = diagnostics
+
+    if is_invalid_sbg_u16(parsed.baseStationId) or is_invalid_sbg_u16(parsed.diffAge):
+        logger.warning(
+            "GNSS corrections do not look valid yet: base_station_id=%s, "
+            "diff_age_raw=%s, position_type=%s/%s. If RTCM is being forwarded, "
+            "check Ellipse serial RTCM input settings, baud rate, wiring, and "
+            "whether the RTCM stream contains compatible MSM/base-station messages.",
+            parsed.baseStationId,
+            parsed.diffAge,
+            position_type,
+            position_type_label(position_type),
+        )
+
+    extra_status_2 = getattr(parsed, "extra_status_2", 0)
+    if is_invalid_sbg_u32(extra_status_2):
+        logger.debug("GNSS1POS extra_status_2 is invalid sentinel: %s", extra_status_2)
+
+    logger.debug(
+        "GNSS diagnostics: raw_status=%s, status_ext=%s, "
+        "position_status=%s, position_type=%s/%s, base_station_id=%s, "
+        "diff_age_seconds=%.2f, extra_status_1=%s, extra_status_2=%s",
+        raw_status,
+        raw_status_ext,
+        position_status,
+        position_type,
+        position_type_label(position_type),
         parsed.baseStationId,
         diff_age_seconds,
+        getattr(parsed, "extra_status_1", 0),
+        extra_status_2,
     )
 
 
@@ -634,8 +831,8 @@ def process_gnss_vel(session, args, decoded_line: str) -> None:
         source_id=source_id,
     )
 
-    speed_over_ground_mps = ( parsed.velN_mps**2 + parsed.velE_mps**2 ) ** 0.5
-    speed_over_ground_knots = speed_over_ground_mps * 1.9438444924406046
+    speed_over_ground_mps = (parsed.velN_mps**2 + parsed.velE_mps**2) ** 0.5
+    speed_over_ground_knots = speed_over_ground_mps * MPS_TO_KNOTS
 
     put_timestamped_float(
         session,
@@ -645,19 +842,14 @@ def process_gnss_vel(session, args, decoded_line: str) -> None:
         timestamp_ns,
         source_id=source_id,
     )
-
-    payload = TimestampedFloat()
-    payload.timestamp.FromNanoseconds(timestamp_ns)
-    payload.value = parsed.track_deg
-
-    keyexp = keelson.construct_pubsub_key(
-        base_path=args.realm,
-        entity_id=args.entity_id,
-        subject="course_over_ground_deg",
+    put_timestamped_float(
+        session,
+        args,
+        "course_over_ground_deg",
+        parsed.track_deg,
+        timestamp_ns,
         source_id=source_id,
     )
-    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
-    logger.debug("Published GNSS course over ground data on %s", keyexp)
 
 
 def process_imu_data(session, args, decoded_line: str) -> None:
