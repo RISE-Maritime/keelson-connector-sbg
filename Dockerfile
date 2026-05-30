@@ -32,8 +32,8 @@ WORKDIR /app
 
 RUN printf '%s\n' \
     '#!/bin/bash' \
-    'set -e' \
-    'sbgBasicLogger "$@" | python /usr/local/bin/main ${PYTHON_ARGS:-}' \
+    'set -euo pipefail' \
+    'stdbuf -oL -eL sbgBasicLogger "$@" | python -u /usr/local/bin/main ${PYTHON_ARGS:-}' \
     > /usr/local/bin/sbg-connector.sh && \
     chmod +x /usr/local/bin/sbg-connector.sh
 
