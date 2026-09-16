@@ -70,6 +70,25 @@ integrate freely and are meaningless), which the same log explains.
 
 `angular_velocity_radps` is converted from the deg/s that `sbgBasicLogger` prints.
 
+### GNSS receiver (`sbg/gnss/0`)
+
+Besides `location_fix`, velocity, course and satellite counts, the GNSS
+receiver's own solution publishes `location_fix_quality` (fix type, position type
+e.g. `POS_TYPE_PSRDIFF`, RTK status) and `location_fix_accuracy_horizontal_m` /
+`_vertical_m`. The "GNSS corrections do not look valid" warning is only logged
+with `--enable-rtcm-input`; without RTCM the base station id is always invalid.
+
+### Device status and magnetometer
+
+The `status` log is logged at WARNING whenever a general health bit (power,
+settings, temperature, CPU…) or an aiding input's *received* bit (GNSS1
+position/velocity/UTC, magnetometer, air data) changes. Compare it with the EKF
+log line: an input can be received but not used by the EKF.
+
+`mag` is not published: the Ellipse reports magnetometers in arbitrary units
+(not gauss) and its accelerometers duplicate `imuData`. It stays in the raw
+recording with `--pub-raw`.
+
 Only **one** process may read the SBG serial port. Two readers split the byte
 stream between them (`SBG_INVALID_FRAME` / CRC errors, `sbgBasicLogger`
 assertion aborts).

@@ -21,6 +21,44 @@ SBG_EKF_SOL_GPS1_VEL_USED = 1 << 10
 SBG_EKF_SOL_GPS1_POS_USED = 1 << 11
 
 
+# Status log (sbgEComLogStatus.h): general status and aiding reception bits.
+SBG_GENERAL_STATUS_BITS = {
+    "main_power": 1 << 0,
+    "imu_power": 1 << 1,
+    "gps_power": 1 << 2,
+    "settings": 1 << 3,
+    "temperature": 1 << 4,
+    "datalogger": 1 << 5,
+    "cpu": 1 << 6,
+}
+SBG_AIDING_RECV_BITS = {
+    "gnss1_pos": 1 << 0,
+    "gnss1_vel": 1 << 1,
+    "gnss1_hdt": 1 << 2,
+    "gnss1_utc": 1 << 3,
+    "mag": 1 << 8,
+    "air_data": 1 << 13,
+}
+
+
+@dataclass
+class DeviceStatus:
+    general: int
+    com: int
+    com2: int
+    aiding: int
+    cpu_pct: int
+
+
+def parse_status_line(line: str) -> DeviceStatus:
+    """Parse a status console line: general, com, com2, aiding, cpu usage."""
+    tokens = re.findall(r"\d+", line.split(":", 1)[1])
+    if len(tokens) != 5:
+        raise ValueError(f"Expected 5 status fields, found {len(tokens)}: {tokens}")
+    general, com, com2, aiding, cpu = (int(t) for t in tokens)
+    return DeviceStatus(general, com, com2, aiding, cpu)
+
+
 def ekf_solution_mode(status: int) -> int:
     """EKF solution mode (0 uninitialized ... 4 full navigation)."""
     return status & SBG_EKF_SOLUTION_MODE_MASK

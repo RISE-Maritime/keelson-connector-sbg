@@ -39,8 +39,12 @@ from keelson.payloads.Primitives_pb2 import (
     TimestampedQuaternion,
 )
 from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
+from keelson.payloads.LocationFixQuality_pb2 import LocationFixQuality
 from sbg_parser import (
+    SBG_AIDING_RECV_BITS,
+    SBG_GENERAL_STATUS_BITS,
     ekf_solution_mode_name,
+    parse_status_line,
     heading_valid,
     position_valid,
     velocity_valid,
@@ -108,6 +112,8 @@ last_gnss_diagnostics: tuple[int, int, int, int, int] | None = None
 last_attitude_rad: tuple[float, float] | None = None
 # Last logged EKF validity per log, so only changes are logged.
 last_ekf_validity: dict[str, tuple] = {}
+# Last logged device status flags (general OK bits, aiding received bits).
+last_device_status: tuple | None = None
 
 
 class RtcmWritable(Protocol):
@@ -816,6 +822,31 @@ def process_euler(session, args, decoded_line: str) -> None:
         )
 
 
+def put_gnss_quality(
+    session, args, position_status: int, position_type: int, timestamp_ns: int
+) -> None:
+    """Publish location_fix_quality for the GNSS receiver's own solution.
+
+    SBG position types and the RTK statuses above use the same numbering as
+    LocationFixQuality.PosType / RtkStatus, so they map one to one.
+    """
+    payload = LocationFixQuality()
+    payload.timestamp.FromNanoseconds(timestamp_ns)
+    if position_status == 0 and position_type != SBG_POS_TYPE_NO_SOLUTION:
+        payload.fix_type = LocationFixQuality.FIX_3D
+    else:
+        payload.fix_type = LocationFixQuality.FIX_NO
+    if position_type in LocationFixQuality.PosType.values():
+        payload.pos_type = position_type
+    else:
+        payload.pos_type = LocationFixQuality.POS_TYPE_UNKNOWN
+    payload.rtk_status = position_type_to_rtk_status(position_type)
+    payload.integrity = LocationFixQuality.INTEGRITY_UNKNOWN
+
+    keyexp = build_keyexp(args, "location_fix_quality", channel="gnss")
+    session.put(keyexp, keelson.enclose(payload.SerializeToString()))
+
+
 def process_gnss_pos(session, args, decoded_line: str) -> None:
     """Process GNSS1POS message."""
     global last_gnss_diagnostics
@@ -857,6 +888,26 @@ def process_gnss_pos(session, args, decoded_line: str) -> None:
             channel="gnss",
         )
 
+    put_gnss_quality(session, args, position_status, position_type, timestamp_ns)
+    if not math.isnan(parsed.lat_std_meters) and not math.isnan(parsed.lon_std_meters):
+        put_timestamped_float(
+            session,
+            args,
+            "location_fix_accuracy_horizontal_m",
+            math.hypot(parsed.lat_std_meters, parsed.lon_std_meters),
+            timestamp_ns,
+            channel="gnss",
+        )
+    if not math.isnan(parsed.alt_std_meters):
+        put_timestamped_float(
+            session,
+            args,
+            "location_fix_accuracy_vertical_m",
+            parsed.alt_std_meters,
+            timestamp_ns,
+            channel="gnss",
+        )
+
     diagnostics = (
         raw_status,
         raw_status_ext,
@@ -884,7 +935,11 @@ def process_gnss_pos(session, args, decoded_line: str) -> None:
         )
         last_gnss_diagnostics = diagnostics
 
-    if is_invalid_sbg_u16(parsed.baseStationId) or is_invalid_sbg_u16(parsed.diffAge):
+    # Only meaningful when corrections are expected: without RTCM input the base
+    # station id is always the invalid sentinel, on every GNSS message.
+    if getattr(args, "enable_rtcm_input", False) and (
+        is_invalid_sbg_u16(parsed.baseStationId) or is_invalid_sbg_u16(parsed.diffAge)
+    ):
         logger.warning(
             "GNSS corrections do not look valid yet: base_station_id=%s, "
             "diff_age_raw=%s, position_type=%s/%s. If RTCM is being forwarded, "
@@ -1016,31 +1071,48 @@ def process_imu_data(session, args, decoded_line: str) -> None:
 
 
 def process_mag(session, args, decoded_line: str) -> None:
-    """Process MAG message."""
+    """Process MAG message.
+
+    Parsed but not published: the Ellipse reports magnetometers in arbitrary
+    units, not gauss, and the accelerometers in this log duplicate imuData.
+    The line is still recorded on the raw subject with --pub-raw.
+    """
     parsed = parse_mag_data_line(decoded_line)
     logger.debug("Parsed magnetometer data: %s", parsed)
 
-    timestamp_ns = time.time_ns()
 
-    put_vector(
-        session,
-        args,
-        "magnetic_field_gauss",
-        parsed.magX_au,
-        parsed.magY_au,
-        parsed.magZ_au,
-        timestamp_ns,
-        channel="magnetometer",
+def process_status(
+    session, args, decoded_line: str
+) -> None:  # pylint: disable=unused-argument
+    """Process STATUS message: log device health and aiding reception changes.
+
+    Logs at WARNING whenever a general OK bit or an aiding input's "received"
+    bit changes, e.g. GNSS position stops arriving at the EKF.
+    """
+    global last_device_status
+
+    parsed = parse_status_line(decoded_line)
+    general = tuple(
+        (name, bool(parsed.general & bit))
+        for name, bit in SBG_GENERAL_STATUS_BITS.items()
     )
-    put_vector(
-        session,
-        args,
-        "linear_acceleration_mpss",
-        parsed.accelerationX_mps2,
-        parsed.accelerationY_mps2,
-        parsed.accelerationZ_mps2,
-        timestamp_ns,
-        channel="magnetometer",
+    aiding = tuple(
+        (name, bool(parsed.aiding & bit)) for name, bit in SBG_AIDING_RECV_BITS.items()
+    )
+    state = (general, aiding)
+    if state == last_device_status:
+        return
+    last_device_status = state
+
+    not_ok = [name for name, ok in general if not ok]
+    received = [name for name, ok in aiding if ok]
+    logger.warning(
+        "SBG device status: general=0x%X %s, aiding received=%s (aiding=0x%X, cpu=%d%%)",
+        parsed.general,
+        f"NOT OK: {', '.join(not_ok)}" if not_ok else "all OK",
+        ", ".join(received) or "none",
+        parsed.aiding,
+        parsed.cpu_pct,
     )
 
 
@@ -1064,12 +1136,12 @@ def process_decoded_line(session, args, decoded_line: str, raw_line: bytes) -> N
         "GNSS1VEL": process_gnss_vel,
         "IMUDATA": process_imu_data,
         "MAG": process_mag,
+        "STATUS": process_status,
     }
 
     handler = handlers.get(topic_upper)
     if handler is None:
-        if topic_upper != "STATUS":
-            logger.warning("Unknown topic: %s", topic_upper)
+        logger.warning("Unknown topic: %s", topic_upper)
         return
 
     try:

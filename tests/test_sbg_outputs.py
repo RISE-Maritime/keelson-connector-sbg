@@ -1,4 +1,4 @@
-"""Tests for EKF-status gating, heading, accuracies and yaw rate.
+"""Tests for EKF-status gating, heading, accuracies, yaw rate, GNSS quality and status.
 
 Sample lines are sbgBasicLogger console output (-p --status-format=decimal)
 captured from the Ellipse-N on case, 2026-09-16.
@@ -201,3 +201,85 @@ def test_imu_yaw_rate_needs_attitude_first(bus):
         pitch
     )
     assert floats(published)["yaw_rate_degps/sbg/ins/0"] == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------- GNSS, status, mag
+
+# Real lines, 2026-09-16: DGPS (position type 3), 16 satellites, no base station.
+GNSS_POS = (
+    "gnss1Pos    : 37056       273         319562200   38.473986   -8.869593"
+    "   8.514999    48.138004   0.389000    0.389000    0.534000    255"
+    "         16          65535       65535       0           429496"
+)
+STATUS = "status      : 127         97          167         8459        255"
+MAG = (
+    "mag         : 511         0.418055    -0.789704   -0.773458   -0.022151"
+    "   -0.006232   -9.741590"
+)
+
+
+def test_gnss_pos_publishes_quality_and_accuracy(bus):
+    from keelson.payloads.LocationFixQuality_pb2 import LocationFixQuality
+
+    session, args, published = bus
+    args.enable_rtcm_input = False
+    sbg_main.process_gnss_pos(session, args, GNSS_POS)
+
+    values = floats(published)
+    assert values["location_fix_accuracy_horizontal_m/sbg/gnss/0"] == pytest.approx(
+        math.hypot(0.389, 0.389)
+    )
+    assert values["location_fix_accuracy_vertical_m/sbg/gnss/0"] == pytest.approx(0.534)
+
+    envelope = next(v for k, v in published if "/location_fix_quality/sbg/gnss/0" in k)
+    _, _, payload_bytes = keelson.uncover(envelope)
+    quality = LocationFixQuality()
+    quality.ParseFromString(payload_bytes)
+    assert quality.fix_type == LocationFixQuality.FIX_3D
+    assert quality.pos_type == LocationFixQuality.POS_TYPE_PSRDIFF
+    assert quality.rtk_status == LocationFixQuality.RTK_STATUS_DIFFERENTIAL
+
+
+def test_gnss_pos_no_correction_warning_without_rtcm(bus, caplog):
+    session, args, _ = bus
+    args.enable_rtcm_input = False
+    with caplog.at_level("WARNING", logger="ellipse_n"):
+        sbg_main.process_gnss_pos(session, args, GNSS_POS)
+    assert not [r for r in caplog.records if "corrections" in r.getMessage()]
+
+
+def test_gnss_pos_correction_warning_with_rtcm(bus, caplog):
+    session, args, _ = bus
+    args.enable_rtcm_input = True
+    with caplog.at_level("WARNING", logger="ellipse_n"):
+        sbg_main.process_gnss_pos(session, args, GNSS_POS)
+    assert [r for r in caplog.records if "corrections" in r.getMessage()]
+
+
+def test_parse_status_line():
+    status = sbg_parser.parse_status_line(STATUS)
+    assert (status.general, status.aiding, status.cpu_pct) == (127, 8459, 255)
+
+
+def test_status_logs_once_per_change(bus, caplog):
+    session, args, published = bus
+    sbg_main.last_device_status = None
+    lost_gnss = STATUS.replace("8459", "8448")  # gnss1 pos/vel/utc no longer received
+    with caplog.at_level("WARNING", logger="ellipse_n"):
+        for line in (STATUS, STATUS, lost_gnss):
+            sbg_main.process_status(session, args, line)
+    sbg_main.last_device_status = None
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(messages) == 2
+    assert "all OK" in messages[0]
+    assert (
+        "aiding received=gnss1_pos, gnss1_vel, gnss1_utc, mag, air_data" in messages[0]
+    )
+    assert "aiding received=mag, air_data" in messages[1]
+    assert published == []
+
+
+def test_mag_is_not_published(bus):
+    session, args, published = bus
+    sbg_main.process_mag(session, args, MAG)
+    assert published == []
