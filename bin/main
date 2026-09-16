@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import sys
 import time
@@ -39,6 +40,11 @@ from keelson.payloads.Primitives_pb2 import (
 )
 from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
 from sbg_parser import (
+    ekf_solution_mode_name,
+    heading_valid,
+    position_valid,
+    velocity_valid,
+    yaw_rate,
     parse_air_data_line,
     parse_euler_line,
     parse_gnss_pos_line as parse_gnss_pos_line_from_parser,
@@ -97,6 +103,11 @@ rtcm_bytes_forwarded = 0
 last_rtcm_log_time = 0.0
 last_rtcm_received_time = 0.0
 last_gnss_diagnostics: tuple[int, int, int, int, int] | None = None
+
+# Latest EKF attitude (roll_rad, pitch_rad) for deriving yaw rate from IMU data.
+last_attitude_rad: tuple[float, float] | None = None
+# Last logged EKF validity per log, so only changes are logged.
+last_ekf_validity: dict[str, tuple] = {}
 
 
 class RtcmWritable(Protocol):
@@ -559,32 +570,77 @@ def publish_raw_line(pub_raw, line: bytes) -> None:
     pub_raw.put(keelson.enclose(payload.SerializeToString()))
 
 
+def log_ekf_validity(log_name: str, status: int, **flags: bool) -> None:
+    """Log at WARNING when the EKF solution mode or a validity flag changes.
+
+    Explains gaps in the gated subjects (heading, INS position and velocity).
+    """
+    state = (ekf_solution_mode_name(status), tuple(sorted(flags.items())))
+    if last_ekf_validity.get(log_name) == state:
+        return
+    last_ekf_validity[log_name] = state
+    logger.warning(
+        "SBG EKF %s: mode=%s status=0x%X %s",
+        log_name,
+        state[0],
+        status,
+        " ".join(f"{name}={'yes' if ok else 'NO'}" for name, ok in flags.items()),
+    )
+
+
 def process_nav(session, args, decoded_line: str) -> None:
-    """Process NAV message."""
+    """Process NAV message.
+
+    INS position and velocity are published only while the EKF flags them
+    valid: outside NAV_POSITION / NAV_VELOCITY mode they integrate freely and
+    are meaningless (e.g. latitude 88 deg while moored).
+    """
     parsed = parse_nav_line(decoded_line)
     logger.debug("Parsed navigation data: %s", parsed)
 
+    pos_ok = position_valid(parsed.status)
+    vel_ok = velocity_valid(parsed.status)
+    log_ekf_validity("nav", parsed.status, position_valid=pos_ok, velocity_valid=vel_ok)
+
     timestamp_ns = time.time_ns()
-    put_location_fix(
-        session,
-        args,
-        "location_fix",
-        parsed.lat_degrees,
-        parsed.lon_degrees,
-        parsed.alt_meters,
-        timestamp_ns,
-        channel="ins",
-    )
-    put_vector(
-        session,
-        args,
-        "ned_velocity_mps",
-        parsed.velN_mps,
-        parsed.velE_mps,
-        parsed.velD_mps,
-        timestamp_ns,
-        channel="ins",
-    )
+    if pos_ok:
+        put_location_fix(
+            session,
+            args,
+            "location_fix",
+            parsed.lat_degrees,
+            parsed.lon_degrees,
+            parsed.alt_meters,
+            timestamp_ns,
+            channel="ins",
+        )
+        put_timestamped_float(
+            session,
+            args,
+            "location_fix_accuracy_horizontal_m",
+            math.hypot(parsed.latitudeStd_meters, parsed.longitudeStd_meters),
+            timestamp_ns,
+            channel="ins",
+        )
+        put_timestamped_float(
+            session,
+            args,
+            "location_fix_accuracy_vertical_m",
+            parsed.altitudeStd_meters,
+            timestamp_ns,
+            channel="ins",
+        )
+    if vel_ok:
+        put_vector(
+            session,
+            args,
+            "ned_velocity_mps",
+            parsed.velN_mps,
+            parsed.velE_mps,
+            parsed.velD_mps,
+            timestamp_ns,
+            channel="ins",
+        )
 
 
 def process_ship_motion(session, args, decoded_line: str) -> None:
@@ -710,6 +766,55 @@ def process_euler(session, args, decoded_line: str) -> None:
         timestamp_ns,
         channel="ins",
     )
+
+    global last_attitude_rad
+    last_attitude_rad = (math.radians(parsed.roll_deg), math.radians(parsed.pitch_deg))
+
+    # 1-sigma accuracies: the quality signal for the angles, published always.
+    for subject, value in (
+        ("roll_accuracy_deg", parsed.rollStd_deg),
+        ("pitch_accuracy_deg", parsed.pitchStd_deg),
+        ("heading_accuracy_deg", parsed.yawStd_deg),
+    ):
+        if not math.isnan(value):
+            put_timestamped_float(
+                session, args, subject, value, timestamp_ns, channel="ins"
+            )
+
+    if not math.isnan(parsed.magDeclination_deg):
+        put_timestamped_float(
+            session,
+            args,
+            "magnetic_variation_deg",
+            parsed.magDeclination_deg,
+            timestamp_ns,
+            channel="ins",
+        )
+
+    # yaw is the geographic (true) heading in [-180, 180], but only meaningful
+    # once the EKF has a heading reference (AHRS mode or better). In
+    # VERTICAL_GYRO mode it drifts freely, so heading is gated on the flag.
+    status = int(float(parsed.status))
+    heading_ok = heading_valid(status)
+    log_ekf_validity("euler", status, heading_valid=heading_ok)
+    if heading_ok:
+        put_timestamped_float(
+            session,
+            args,
+            "heading_true_north_deg",
+            parsed.yaw_deg % 360.0,
+            timestamp_ns,
+            channel="ins",
+        )
+        if not math.isnan(parsed.magHeading_deg):
+            put_timestamped_float(
+                session,
+                args,
+                "heading_magnetic_deg",
+                parsed.magHeading_deg % 360.0,
+                timestamp_ns,
+                channel="ins",
+            )
 
 
 def process_gnss_pos(session, args, decoded_line: str) -> None:
@@ -869,16 +974,33 @@ def process_imu_data(session, args, decoded_line: str) -> None:
         timestamp_ns,
         channel="imu",
     )
+    # sbgBasicLogger prints gyroscopes in deg/s; the subject is rad/s.
     put_vector(
         session,
         args,
         "angular_velocity_radps",
-        parsed.gyroX_radps,
-        parsed.gyroY_radps,
-        parsed.gyroZ_radps,
+        math.radians(parsed.gyroX_degps),
+        math.radians(parsed.gyroY_degps),
+        math.radians(parsed.gyroZ_degps),
         timestamp_ns,
         channel="imu",
     )
+
+    # Earth-frame yaw rate from body rates and the latest EKF attitude. Unlike
+    # heading it needs no heading reference, so it is valid in any EKF mode.
+    if last_attitude_rad is not None:
+        rate_degps = yaw_rate(
+            parsed.gyroY_degps, parsed.gyroZ_degps, *last_attitude_rad
+        )
+        if rate_degps is not None and not math.isnan(rate_degps):
+            put_timestamped_float(
+                session,
+                args,
+                "yaw_rate_degps",
+                rate_degps,
+                timestamp_ns,
+                channel="ins",
+            )
 
     payload = TimestampedFloat()
     payload.timestamp.FromNanoseconds(timestamp_ns)

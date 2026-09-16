@@ -44,6 +44,35 @@ SBG device and streaming all the sensor data:
 ✅ status - System status
 ✅ utcTime - UTC timestamps
 
+### Heading, yaw and EKF validity
+
+`yaw_deg` is the Ellipse EKF yaw: the **geographic (true) heading**, signed
+−180…+180°, but only meaningful once the EKF has a heading reference (solution
+mode AHRS or better). In `VERTICAL_GYRO` mode it drifts freely. The connector
+reads the EKF status bitmask that `--status-format=decimal` prints first on each
+`euler`/`nav` line and publishes on `sbg/ins/0`:
+
+| Subject | Source | Published |
+|---|---|---|
+| `roll_deg`, `pitch_deg`, `yaw_deg` | euler | always |
+| `roll_accuracy_deg`, `pitch_accuracy_deg`, `heading_accuracy_deg` | euler std dev (1σ) | always |
+| `heading_true_north_deg` | yaw, 0…360° | only when the EKF flags **heading valid** |
+| `heading_magnetic_deg` | euler magnetic heading, 0…360° | heading valid and available |
+| `magnetic_variation_deg` | magnetic declination, east positive | when available |
+| `yaw_rate_degps` | IMU gyro Y/Z + latest roll/pitch | always (needs no heading reference) |
+| `location_fix`, `location_fix_accuracy_horizontal_m`, `location_fix_accuracy_vertical_m` | nav | only when **position valid** |
+| `ned_velocity_mps` | nav | only when **velocity valid** |
+
+Every change of EKF mode or validity is logged once at WARNING, e.g.
+`SBG EKF euler: mode=VERTICAL_GYRO status=0x111 heading_valid=NO`, which explains
+gaps in the gated subjects.
+
+`angular_velocity_radps` is converted from the deg/s that `sbgBasicLogger` prints.
+
+Only **one** process may read the SBG serial port. Two readers split the byte
+stream between them (`SBG_INVALID_FRAME` / CRC errors, `sbgBasicLogger`
+assertion aborts).
+
 
 
 

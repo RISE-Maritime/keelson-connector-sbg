@@ -2,6 +2,60 @@ from dataclasses import dataclass
 import re
 import math
 
+# EKF solution status (euler, quat and nav logs), from sbgECom
+# src/logs/sbgEComLogEkf.h. The low 4 bits are the solution mode.
+SBG_EKF_SOLUTION_MODE_MASK = 0xF
+SBG_EKF_SOL_MODE_NAMES = {
+    0: "UNINITIALIZED",
+    1: "VERTICAL_GYRO",
+    2: "AHRS",
+    3: "NAV_VELOCITY",
+    4: "NAV_POSITION",
+}
+SBG_EKF_SOL_ATTITUDE_VALID = 1 << 4
+SBG_EKF_SOL_HEADING_VALID = 1 << 5
+SBG_EKF_SOL_VELOCITY_VALID = 1 << 6
+SBG_EKF_SOL_POSITION_VALID = 1 << 7
+SBG_EKF_SOL_MAG_REF_USED = 1 << 9
+SBG_EKF_SOL_GPS1_VEL_USED = 1 << 10
+SBG_EKF_SOL_GPS1_POS_USED = 1 << 11
+
+
+def ekf_solution_mode(status: int) -> int:
+    """EKF solution mode (0 uninitialized ... 4 full navigation)."""
+    return status & SBG_EKF_SOLUTION_MODE_MASK
+
+
+def ekf_solution_mode_name(status: int) -> str:
+    mode = ekf_solution_mode(status)
+    return SBG_EKF_SOL_MODE_NAMES.get(mode, f"MODE_{mode}")
+
+
+def heading_valid(status: int) -> bool:
+    """True when the EKF flags heading as reliable."""
+    return bool(status & SBG_EKF_SOL_HEADING_VALID)
+
+
+def velocity_valid(status: int) -> bool:
+    return bool(status & SBG_EKF_SOL_VELOCITY_VALID)
+
+
+def position_valid(status: int) -> bool:
+    return bool(status & SBG_EKF_SOL_POSITION_VALID)
+
+
+def yaw_rate(gyro_y: float, gyro_z: float, roll_rad: float, pitch_rad: float):
+    """Yaw (heading) rate from body rates and attitude, or None near pitch +-90.
+
+    Euler kinematics for the SBG body frame (X forward, Y right, Z down):
+    yaw_rate = (q sin(roll) + r cos(roll)) / cos(pitch). Linear in the rates,
+    so the result is in the unit of gyro_y / gyro_z.
+    """
+    cos_pitch = math.cos(pitch_rad)
+    if abs(cos_pitch) < 1e-3:
+        return None
+    return (gyro_y * math.sin(roll_rad) + gyro_z * math.cos(roll_rad)) / cos_pitch
+
 @dataclass
 class SbgEkfNav:
     velN_mps: float
@@ -17,6 +71,7 @@ class SbgEkfNav:
     longitudeStd_meters: float
     altitudeStd_meters: float
     undulation_meters: float
+    status: int = 0
 
 def preprocess_nav_line(line: str) -> str:
     # Add a space between concatenated numeric values
@@ -46,7 +101,8 @@ def parse_nav_line(line: str) -> SbgEkfNav:
         latitudeStd_meters=float(tokens[10]),
         longitudeStd_meters=float(tokens[11]),
         altitudeStd_meters=float(tokens[12]),
-        undulation_meters=float(tokens[13])
+        undulation_meters=float(tokens[13]),
+        status=int(float(tokens[0])),
     )
 
 @dataclass
@@ -339,13 +395,14 @@ def parse_gnss_vel_line(line: str) -> GnssVel:
 
 @dataclass
 class ImuData:
+    # sbgBasicLogger console prints gyroscopes in deg/s (getGyroscopeDeg).
     status: str
     accX_mps2: float
     accY_mps2: float
     accZ_mps2: float
-    gyroX_radps: float
-    gyroY_radps: float
-    gyroZ_radps: float
+    gyroX_degps: float
+    gyroY_degps: float
+    gyroZ_degps: float
     temperature_degC: float
 
 def parse_imu_data_line(line: str) -> ImuData:
@@ -366,9 +423,9 @@ def parse_imu_data_line(line: str) -> ImuData:
         accX_mps2=parse_float(tokens[1]),
         accY_mps2=parse_float(tokens[2]),
         accZ_mps2=parse_float(tokens[3]),
-        gyroX_radps=parse_float(tokens[4]),
-        gyroY_radps=parse_float(tokens[5]),
-        gyroZ_radps=parse_float(tokens[6]),
+        gyroX_degps=parse_float(tokens[4]),
+        gyroY_degps=parse_float(tokens[5]),
+        gyroZ_degps=parse_float(tokens[6]),
         temperature_degC=parse_float(tokens[7])
     )
 
