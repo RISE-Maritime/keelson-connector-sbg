@@ -283,3 +283,50 @@ def test_mag_is_not_published(bus):
     session, args, published = bus
     sbg_main.process_mag(session, args, MAG)
     assert published == []
+
+
+def test_gnss_quality_works_with_fix_type_only_proto(bus, monkeypatch):
+    """keelson 0.5.0's LocationFixQuality has only timestamp and fix_type."""
+    from google.protobuf import descriptor_pb2, descriptor_pool, timestamp_pb2
+    from google.protobuf import message_factory
+
+    file_proto = descriptor_pb2.FileDescriptorProto(
+        name="old_lfq.proto",
+        package="oldkeelson",
+        syntax="proto3",
+        dependency=["google/protobuf/timestamp.proto"],
+    )
+    msg = file_proto.message_type.add(name="LocationFixQuality")
+    enum = msg.enum_type.add(name="FixType")
+    for number, name in enumerate(["UNKNOWN", "INVALID", "FIX_NO", "FIX_2D", "FIX_3D"]):
+        enum.value.add(name=name, number=number)
+    msg.field.add(
+        name="timestamp",
+        number=1,
+        type=11,
+        label=1,
+        type_name=".google.protobuf.Timestamp",
+    )
+    msg.field.add(
+        name="fix_type",
+        number=2,
+        type=14,
+        label=1,
+        type_name=".oldkeelson.LocationFixQuality.FixType",
+    )
+    pool = descriptor_pool.DescriptorPool()
+    pool.AddSerializedFile(timestamp_pb2.DESCRIPTOR.serialized_pb)
+    pool.Add(file_proto)
+    old_cls = message_factory.GetMessageClass(
+        pool.FindMessageTypeByName("oldkeelson.LocationFixQuality")
+    )
+    old_cls.FIX_3D = 4
+    old_cls.FIX_NO = 2
+    monkeypatch.setattr(sbg_main, "LocationFixQuality", old_cls)
+
+    session, args, published = bus
+    sbg_main.put_gnss_quality(session, args, 0, 3, 1)
+    _, _, payload_bytes = keelson.uncover(published[0][1])
+    decoded = old_cls()
+    decoded.ParseFromString(payload_bytes)
+    assert decoded.fix_type == 4

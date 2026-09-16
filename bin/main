@@ -841,12 +841,15 @@ def put_gnss_quality(
         payload.fix_type = LocationFixQuality.FIX_3D
     else:
         payload.fix_type = LocationFixQuality.FIX_NO
-    if position_type in LocationFixQuality.PosType.values():
-        payload.pos_type = position_type
-    else:
-        payload.pos_type = LocationFixQuality.POS_TYPE_UNKNOWN
-    payload.rtk_status = position_type_to_rtk_status(position_type)
-    payload.integrity = LocationFixQuality.INTEGRITY_UNKNOWN
+
+    # pos_type / rtk_status / integrity were added in later keelson releases
+    # (keelson 0.5.0 only has fix_type); set them only when present.
+    fields = LocationFixQuality.DESCRIPTOR.fields_by_name
+    if "pos_type" in fields:
+        valid_pos_types = {v.number for v in fields["pos_type"].enum_type.values}
+        payload.pos_type = position_type if position_type in valid_pos_types else 1
+    if "rtk_status" in fields:
+        payload.rtk_status = position_type_to_rtk_status(position_type)
 
     keyexp = build_keyexp(args, "location_fix_quality", channel="gnss")
     session.put(keyexp, keelson.enclose(payload.SerializeToString()))
