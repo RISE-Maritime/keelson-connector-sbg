@@ -88,7 +88,9 @@ def set_target_type_enum(target_type):
         return VesselInformation.VesselType.OTHER
 
 
-def position_to_common_center_point(latitude, longitude, heading, to_bow, to_stern, to_port, to_starboard):
+def position_to_common_center_point(
+    latitude, longitude, heading, to_bow, to_stern, to_port, to_starboard
+):
     # Longitudinal
     midpointL = (to_bow + to_stern) / 2
     if midpointL > to_bow:
@@ -108,9 +110,11 @@ def position_to_common_center_point(latitude, longitude, heading, to_bow, to_ste
         move_lat = 0
 
     point_long_adj = geopy.distance.distance(meters=move_long).destination(
-        (latitude, longitude), bearing=heading)
+        (latitude, longitude), bearing=heading
+    )
     point_final = geopy.distance.distance(meters=move_lat).destination(
-        (point_long_adj.latitude, point_long_adj.longitude), bearing=heading+90)
+        (point_long_adj.latitude, point_long_adj.longitude), bearing=heading + 90
+    )
 
     return point_final.latitude, point_final.longitude
 
@@ -146,11 +150,9 @@ def publish_message(payload, subject: str, mmsi, session, args, logging):
         realm=args.realm,
         entity_id=args.entity_id,
         subject=subject,  # Needs to be a supported subject
-        source_id="ais/"+str(mmsi),
+        source_id="ais/" + str(mmsi),
     )
-    pub = session.declare_publisher(
-        key_exp_pub_target
-    )
+    pub = session.declare_publisher(key_exp_pub_target)
 
     # Publish the target
     serialized_payload_target = payload.SerializeToString()
@@ -169,7 +171,10 @@ def position_within_boundary(latitude: float, longitude: float, args):
     :return: True if within boundary, False if outside boundary
 
     """
-    if args.boundary_north >= latitude >= args.boundary_south and args.boundary_east >= longitude >= args.boundary_west:
+    if (
+        args.boundary_north >= latitude >= args.boundary_south
+        and args.boundary_east >= longitude >= args.boundary_west
+    ):
         return True
     else:
         return False
@@ -193,7 +198,14 @@ def corrBering(bering):
 
 
 def getPredictorPositionsByTime(
-    predict_minutes, from_latitude, from_longitude, sog, cog, rot, heading, num_of_predictions=10
+    predict_minutes,
+    from_latitude,
+    from_longitude,
+    sog,
+    cog,
+    rot,
+    heading,
+    num_of_predictions=10,
 ):
     """
     Predictor positions and headings

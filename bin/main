@@ -316,7 +316,6 @@ def position_type_to_rtk_status(position_type: int) -> int:
     return RTK_STATUS_UNKNOWN
 
 
-
 def position_type_label(position_type: int) -> str:
     """Return a readable SBG GNSS position type label."""
     labels = {
@@ -362,9 +361,7 @@ def parse_gnss_pos_line(decoded_line: str):
 
     normalized_line = re.sub(r"(\d)([-+])", r"\1 \2", decoded_line)
     tokens = re.findall(
-        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?"
-        r"|[-+]?\d+(?:[eE][-+]?\d+)?"
-        r"|nan",
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?" r"|[-+]?\d+(?:[eE][-+]?\d+)?" r"|nan",
         normalized_line,
     )
 
@@ -663,7 +660,9 @@ def process_ship_motion(session, args, decoded_line: str) -> None:
     }
 
     for subject, value in fields.items():
-        put_timestamped_float(session, args, subject, value, timestamp_ns, channel="ship_motion")
+        put_timestamped_float(
+            session, args, subject, value, timestamp_ns, channel="ship_motion"
+        )
 
 
 def process_air_data(session, args, decoded_line: str) -> None:
@@ -1076,7 +1075,9 @@ def process_decoded_line(session, args, decoded_line: str, raw_line: bytes) -> N
     try:
         handler(session, args, decoded_line)
     except Exception:
-        logger.exception("Error parsing %s message. Raw line: %r", topic_upper, raw_line)
+        logger.exception(
+            "Error parsing %s message. Raw line: %r", topic_upper, raw_line
+        )
 
 
 def main() -> int:

@@ -56,6 +56,7 @@ def yaw_rate(gyro_y: float, gyro_z: float, roll_rad: float, pitch_rad: float):
         return None
     return (gyro_y * math.sin(roll_rad) + gyro_z * math.cos(roll_rad)) / cos_pitch
 
+
 @dataclass
 class SbgEkfNav:
     velN_mps: float
@@ -73,20 +74,26 @@ class SbgEkfNav:
     undulation_meters: float
     status: int = 0
 
+
 def preprocess_nav_line(line: str) -> str:
     # Add a space between concatenated numeric values
     line = re.sub(r"(\d)([-+])", r"\1 \2", line)
     return line
+
 
 def parse_nav_line(line: str) -> SbgEkfNav:
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line)
-    
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line
+    )
+
     if len(tokens) != 14:
-        raise ValueError(f"Expected 14 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 14 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     return SbgEkfNav(
         velN_mps=float(tokens[1]),
@@ -105,6 +112,7 @@ def parse_nav_line(line: str) -> SbgEkfNav:
         status=int(float(tokens[0])),
     )
 
+
 @dataclass
 class ShipMotion:
     status: str
@@ -119,15 +127,20 @@ class ShipMotion:
     swayVel_mps: float
     heaveVel_mps: float
 
+
 def parse_ship_motion_line(line: str) -> ShipMotion:
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line)
-    
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line
+    )
+
     if len(tokens) != 11:
-        raise ValueError(f"Expected 11 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 11 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     return ShipMotion(
         status=tokens[0],
@@ -140,7 +153,7 @@ def parse_ship_motion_line(line: str) -> ShipMotion:
         heaveAccel_mps2=float(tokens[7]),
         surgeVel_mps=float(tokens[8]),
         swayVel_mps=float(tokens[9]),
-        heaveVel_mps=float(tokens[10])
+        heaveVel_mps=float(tokens[10]),
     )
 
 
@@ -153,12 +166,15 @@ class AirData:
     trueAirspeed_mps: float
     airTemperature_degC: float
 
+
 def parse_air_data_line(line: str) -> AirData:
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line)
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line
+    )
 
     if len(tokens) == 5:
         # Handle 5-field format: [pressureAbs_pa, altitude_meters, pressureDiff_pa, trueAirspeed_mps, airTemperature_degC]
@@ -168,7 +184,7 @@ def parse_air_data_line(line: str) -> AirData:
             altitude_meters=float(tokens[1]),
             pressureDiff_pa=float(tokens[2]),
             trueAirspeed_mps=float(tokens[3]),
-            airTemperature_degC=float(tokens[4])
+            airTemperature_degC=float(tokens[4]),
         )
     elif len(tokens) == 6:
         # Handle 6-field format: [status, pressureAbs_pa, altitude_meters, pressureDiff_pa, trueAirspeed_mps, airTemperature_degC]
@@ -178,10 +194,12 @@ def parse_air_data_line(line: str) -> AirData:
             altitude_meters=float(tokens[2]),
             pressureDiff_pa=float(tokens[3]),
             trueAirspeed_mps=float(tokens[4]),
-            airTemperature_degC=float(tokens[5])
+            airTemperature_degC=float(tokens[5]),
         )
     else:
-        raise ValueError(f"Expected 5 or 6 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 5 or 6 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
 
 @dataclass
@@ -199,16 +217,23 @@ class UtcTime:
     clkSfErrorStd_ppm: int
     clkResidualError_us: int
 
+
 def parse_utc_time_line(line: str) -> UtcTime:
     # Match the full line and extract the fields
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line)
-    
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?", line
+    )
+
     if len(tokens) != 9:
-        raise ValueError(f"Expected 9 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 9 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     return UtcTime(
         status=tokens[0],
-        gps_time_of_week_ms=int(float(tokens[1])),  # Convert to float first, then to int
+        gps_time_of_week_ms=int(
+            float(tokens[1])
+        ),  # Convert to float first, then to int
         gps_year=int(float(tokens[2])),
         gps_month=int(float(tokens[3])),
         gps_day=int(float(tokens[4])),
@@ -218,8 +243,9 @@ def parse_utc_time_line(line: str) -> UtcTime:
         gps_nanosecond=int(float(tokens[8])),
         clkBiasStd_us=0,  # Placeholder, adjust as needed
         clkSfErrorStd_ppm=0,  # Placeholder, adjust as needed
-        clkResidualError_us=0  # Placeholder, adjust as needed
+        clkResidualError_us=0,  # Placeholder, adjust as needed
     )
+
 
 @dataclass
 class Quat:
@@ -234,19 +260,24 @@ class Quat:
     magDeclination_deg: float
     magInclination_deg: float
 
+
 def parse_quat_line(line: str) -> Quat:
 
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields, including 'nan'
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line)
-    
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line
+    )
+
     if len(tokens) != 10:
-        raise ValueError(f"Expected 10 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 10 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     def parse_float(val):
-        return float('nan') if val == 'nan' else float(val)
+        return float("nan") if val == "nan" else float(val)
 
     return Quat(
         status=tokens[0],
@@ -258,8 +289,9 @@ def parse_quat_line(line: str) -> Quat:
         pitchStd=parse_float(tokens[6]),
         yawStd=parse_float(tokens[7]),
         magDeclination_deg=parse_float(tokens[8]),
-        magInclination_deg=parse_float(tokens[9])
+        magInclination_deg=parse_float(tokens[9]),
     )
+
 
 @dataclass
 class Euler:
@@ -274,18 +306,23 @@ class Euler:
     magDeclination_deg: float
     magInclination_deg: float
 
+
 def parse_euler_line(line: str) -> Euler:
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields, including 'nan'
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line)
-    
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line
+    )
+
     if len(tokens) != 10:
-        raise ValueError(f"Expected 10 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 10 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     def parse_float(val):
-        return float('nan') if val == 'nan' else float(val)
+        return float("nan") if val == "nan" else float(val)
 
     return Euler(
         status=tokens[0],
@@ -297,8 +334,9 @@ def parse_euler_line(line: str) -> Euler:
         yawStd_deg=parse_float(tokens[6]),
         magHeading_deg=parse_float(tokens[7]),
         magDeclination_deg=parse_float(tokens[8]),
-        magInclination_deg=parse_float(tokens[9])
+        magInclination_deg=parse_float(tokens[9]),
     )
+
 
 @dataclass
 class GnssPos:
@@ -317,21 +355,26 @@ class GnssPos:
     baseStationId: int = 0  # Default value, adjust as needed
     diffAge: int = 0  # Default value, adjust as needed
 
+
 def parse_gnss_pos_line(line: str) -> GnssPos:
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields, including 'nan'
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line)
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line
+    )
 
     # Ignore the first token (header includes a 1 that needs to be ignored)
     tokens = tokens[1:]
 
     if len(tokens) != 14:
-        raise ValueError(f"Expected 14 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 14 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     def parse_float(val):
-        return float('nan') if val == 'nan' else float(val)
+        return float("nan") if val == "nan" else float(val)
 
     return GnssPos(
         status=tokens[0],
@@ -347,7 +390,7 @@ def parse_gnss_pos_line(line: str) -> GnssPos:
         satellites_tracked=int(float(tokens[10])),
         numSatellitesUsed=int(float(tokens[11])),
         baseStationId=int(float(tokens[12])),
-        diffAge=int(float(tokens[13]))  # Adjusted to include the 14th field
+        diffAge=int(float(tokens[13])),  # Adjusted to include the 14th field
     )
 
 
@@ -364,21 +407,26 @@ class GnssVel:
     track_deg: float
     track_std_deg: float
 
+
 def parse_gnss_vel_line(line: str) -> GnssVel:
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields, including 'nan'
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line)
-    
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line
+    )
+
     # Ignore the first token (header includes a 1 that needs to be ignored)
     tokens = tokens[1:]
 
     if len(tokens) != 10:
-        raise ValueError(f"Expected 10 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 10 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     def parse_float(val):
-        return float('nan') if val == 'nan' else float(val)
+        return float("nan") if val == "nan" else float(val)
 
     return GnssVel(
         status=tokens[0],
@@ -390,8 +438,9 @@ def parse_gnss_vel_line(line: str) -> GnssVel:
         velStdE_mps=parse_float(tokens[6]),
         velStdD_mps=parse_float(tokens[7]),
         track_deg=parse_float(tokens[8]),
-        track_std_deg=parse_float(tokens[9])
+        track_std_deg=parse_float(tokens[9]),
     )
+
 
 @dataclass
 class ImuData:
@@ -405,18 +454,23 @@ class ImuData:
     gyroZ_degps: float
     temperature_degC: float
 
+
 def parse_imu_data_line(line: str) -> ImuData:
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields, including 'nan'
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line)
-    
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line
+    )
+
     if len(tokens) != 8:
-        raise ValueError(f"Expected 8 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 8 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     def parse_float(val):
-        return float('nan') if val == 'nan' else float(val)
+        return float("nan") if val == "nan" else float(val)
 
     return ImuData(
         status=tokens[0],
@@ -426,8 +480,9 @@ def parse_imu_data_line(line: str) -> ImuData:
         gyroX_degps=parse_float(tokens[4]),
         gyroY_degps=parse_float(tokens[5]),
         gyroZ_degps=parse_float(tokens[6]),
-        temperature_degC=parse_float(tokens[7])
+        temperature_degC=parse_float(tokens[7]),
     )
+
 
 @dataclass
 class MagData:
@@ -439,18 +494,23 @@ class MagData:
     accelerationY_mps2: float
     accelerationZ_mps2: float
 
-def parse_mag_data_line(line: str) -> MagData:  
+
+def parse_mag_data_line(line: str) -> MagData:
     # Preprocess the line to handle concatenated numeric values
     line = preprocess_nav_line(line)
 
     # Match the full line and extract the fields, including 'nan'
-    tokens = re.findall(r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line)
-    
+    tokens = re.findall(
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan", line
+    )
+
     if len(tokens) != 7:
-        raise ValueError(f"Expected 7 numeric fields, found {len(tokens)}, tokens: {tokens}")
+        raise ValueError(
+            f"Expected 7 numeric fields, found {len(tokens)}, tokens: {tokens}"
+        )
 
     def parse_float(val):
-        return float('nan') if val == 'nan' else float(val)
+        return float("nan") if val == "nan" else float(val)
 
     return MagData(
         status=tokens[0],
@@ -459,5 +519,5 @@ def parse_mag_data_line(line: str) -> MagData:
         magZ_au=parse_float(tokens[3]),
         accelerationX_mps2=parse_float(tokens[4]),
         accelerationY_mps2=parse_float(tokens[5]),
-        accelerationZ_mps2=parse_float(tokens[6])
+        accelerationZ_mps2=parse_float(tokens[6]),
     )
