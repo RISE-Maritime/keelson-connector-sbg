@@ -3,8 +3,9 @@
 
 This process reads decoded SBG ASCII log lines from stdin, publishes selected
 messages to Keelson, and optionally subscribes to Keelson RTCM v3 corrections
-and forwards the raw correction bytes ([support.sbg-systems.com](https://support.sbg-systems.com/sc/el/latest/how-to-articles/receive-rtk-corrections-via-ntrip-using-ardusimple))configured on the
-Ellipse for RTCM input.
+and forwards the raw correction bytes to the serial port configured on the
+Ellipse for RTCM input. See
+https://support.sbg-systems.com/sc/el/latest/how-to-articles/receive-rtk-corrections-via-ntrip-using-ardusimple
 
 Expected RTCM Keelson topic shape:
     <realm>/<rtcm_entity_id>/raw_rtcm_v3/<rtcm_source_id>
@@ -367,7 +368,7 @@ def parse_gnss_pos_line(decoded_line: str):
 
     normalized_line = re.sub(r"(\d)([-+])", r"\1 \2", decoded_line)
     tokens = re.findall(
-        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?" r"|[-+]?\d+(?:[eE][-+]?\d+)?" r"|nan",
+        r"[-+]?\d*\.\d{1,6}(?:[eE][-+]?\d+)?|[-+]?\d+(?:[eE][-+]?\d+)?|nan",
         normalized_line,
     )
 
@@ -486,7 +487,10 @@ def open_rtcm_output(args) -> tuple[RtcmWritable, bool]:
         )
         return stream, True
 
-    file_stream: BinaryIO = open(output, "ab", buffering=0)
+    # Long-lived output handle, closed on shutdown by the caller.
+    file_stream: BinaryIO = open(  # pylint: disable=consider-using-with
+        output, "ab", buffering=0
+    )
     return file_stream, True
 
 
@@ -514,7 +518,8 @@ def on_rtcm_sample(sample) -> None:
 
     except BrokenPipeError:
         logger.exception("RTCM output pipe closed")
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
+        # A bad sample must not kill the zenoh subscriber callback.
         logger.exception("Error processing RTCM sample")
 
 
@@ -1070,7 +1075,7 @@ def process_imu_data(session, args, decoded_line: str) -> None:
     logger.debug("Published IMU temperature data on %s", keyexp)
 
 
-def process_mag(session, args, decoded_line: str) -> None:
+def process_mag(_session, _args, decoded_line: str) -> None:
     """Process MAG message.
 
     Parsed but not published: the Ellipse reports magnetometers in arbitrary
@@ -1081,9 +1086,7 @@ def process_mag(session, args, decoded_line: str) -> None:
     logger.debug("Parsed magnetometer data: %s", parsed)
 
 
-def process_status(
-    session, args, decoded_line: str
-) -> None:  # pylint: disable=unused-argument
+def process_status(_session, _args, decoded_line: str) -> None:
     """Process STATUS message: log device health and aiding reception changes.
 
     Logs at WARNING whenever a general OK bit or an aiding input's "received"
@@ -1146,7 +1149,8 @@ def process_decoded_line(session, args, decoded_line: str, raw_line: bytes) -> N
 
     try:
         handler(session, args, decoded_line)
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
+        # One malformed line must not stop the stream.
         logger.exception(
             "Error parsing %s message. Raw line: %r", topic_upper, raw_line
         )
@@ -1204,7 +1208,7 @@ def main() -> int:
 
                     process_decoded_line(session, args, decoded_line, raw_line)
 
-                except Exception:
+                except Exception:  # pylint: disable=broad-exception-caught
                     logger.exception("Error decoding line: %r", raw_line)
 
         finally:

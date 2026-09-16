@@ -215,7 +215,7 @@ def parse_air_data_line(line: str) -> AirData:
     )
 
     if len(tokens) == 5:
-        # Handle 5-field format: [pressureAbs_pa, altitude_meters, pressureDiff_pa, trueAirspeed_mps, airTemperature_degC]
+        # 5 fields: pressureAbs, altitude, pressureDiff, trueAirspeed, airTemperature
         return AirData(
             status="0",  # Default status when not provided
             pressureAbs_pa=float(tokens[0]),
@@ -224,8 +224,8 @@ def parse_air_data_line(line: str) -> AirData:
             trueAirspeed_mps=float(tokens[3]),
             airTemperature_degC=float(tokens[4]),
         )
-    elif len(tokens) == 6:
-        # Handle 6-field format: [status, pressureAbs_pa, altitude_meters, pressureDiff_pa, trueAirspeed_mps, airTemperature_degC]
+    if len(tokens) == 6:
+        # 6 fields: status, then the 5 above
         return AirData(
             status=tokens[0],
             pressureAbs_pa=float(tokens[1]),
@@ -234,10 +234,9 @@ def parse_air_data_line(line: str) -> AirData:
             trueAirspeed_mps=float(tokens[4]),
             airTemperature_degC=float(tokens[5]),
         )
-    else:
-        raise ValueError(
-            f"Expected 5 or 6 numeric fields, found {len(tokens)}, tokens: {tokens}"
-        )
+    raise ValueError(
+        f"Expected 5 or 6 numeric fields, found {len(tokens)}, tokens: {tokens}"
+    )
 
 
 @dataclass
