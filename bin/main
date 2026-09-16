@@ -790,30 +790,30 @@ def process_euler(session, args, decoded_line: str) -> None:
             channel="ins",
         )
 
-    # yaw is the geographic (true) heading in [-180, 180], but only meaningful
-    # once the EKF has a heading reference (AHRS mode or better). In
-    # VERTICAL_GYRO mode it drifts freely, so heading is gated on the flag.
+    # yaw is the geographic (true) heading in [-180, 180]. It is only reliable
+    # once the EKF has a heading reference (AHRS mode or better); in
+    # VERTICAL_GYRO mode it drifts freely. Heading is published regardless,
+    # with heading_accuracy_deg beside it (180 deg = unknown), so consumers
+    # judge quality themselves; validity changes are logged.
     status = int(float(parsed.status))
-    heading_ok = heading_valid(status)
-    log_ekf_validity("euler", status, heading_valid=heading_ok)
-    if heading_ok:
+    log_ekf_validity("euler", status, heading_valid=heading_valid(status))
+    put_timestamped_float(
+        session,
+        args,
+        "heading_true_north_deg",
+        parsed.yaw_deg % 360.0,
+        timestamp_ns,
+        channel="ins",
+    )
+    if not math.isnan(parsed.magHeading_deg):
         put_timestamped_float(
             session,
             args,
-            "heading_true_north_deg",
-            parsed.yaw_deg % 360.0,
+            "heading_magnetic_deg",
+            parsed.magHeading_deg % 360.0,
             timestamp_ns,
             channel="ins",
         )
-        if not math.isnan(parsed.magHeading_deg):
-            put_timestamped_float(
-                session,
-                args,
-                "heading_magnetic_deg",
-                parsed.magHeading_deg % 360.0,
-                timestamp_ns,
-                channel="ins",
-            )
 
 
 def process_gnss_pos(session, args, decoded_line: str) -> None:

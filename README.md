@@ -56,16 +56,17 @@ reads the EKF status bitmask that `--status-format=decimal` prints first on each
 |---|---|---|
 | `roll_deg`, `pitch_deg`, `yaw_deg` | euler | always |
 | `roll_accuracy_deg`, `pitch_accuracy_deg`, `heading_accuracy_deg` | euler std dev (1σ) | always |
-| `heading_true_north_deg` | yaw, 0…360° | only when the EKF flags **heading valid** |
-| `heading_magnetic_deg` | euler magnetic heading, 0…360° | heading valid and available |
+| `heading_true_north_deg` | yaw, 0…360° | always — check `heading_accuracy_deg` (180° = unknown) |
+| `heading_magnetic_deg` | euler magnetic heading, 0…360° | when available |
 | `magnetic_variation_deg` | magnetic declination, east positive | when available |
 | `yaw_rate_degps` | IMU gyro Y/Z + latest roll/pitch | always (needs no heading reference) |
 | `location_fix`, `location_fix_accuracy_horizontal_m`, `location_fix_accuracy_vertical_m` | nav | only when **position valid** |
 | `ned_velocity_mps` | nav | only when **velocity valid** |
 
 Every change of EKF mode or validity is logged once at WARNING, e.g.
-`SBG EKF euler: mode=VERTICAL_GYRO status=0x111 heading_valid=NO`, which explains
-gaps in the gated subjects.
+`SBG EKF euler: mode=VERTICAL_GYRO status=0x111 heading_valid=NO`. Heading is
+published even while not valid; the INS position and velocity are not (they
+integrate freely and are meaningless), which the same log explains.
 
 `angular_velocity_radps` is converted from the deg/s that `sbgBasicLogger` prints.
 

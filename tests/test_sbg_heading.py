@@ -121,16 +121,17 @@ def test_yaw_rate_undefined_at_pitch_90():
 # ---------------------------------------------------------------- handlers
 
 
-def test_euler_without_heading_reference_publishes_no_heading(bus):
+def test_euler_without_heading_reference_still_publishes_heading(bus):
+    """Heading is published even when invalid, with its accuracy beside it."""
     session, args, published = bus
     sbg_main.process_euler(session, args, EULER_NO_HEADING)
     values = floats(published)
 
     assert values["yaw_deg/sbg/ins/0"] == pytest.approx(-22.622351)
+    assert values["heading_true_north_deg/sbg/ins/0"] == pytest.approx(337.377649)
     assert values["heading_accuracy_deg/sbg/ins/0"] == pytest.approx(180.0)
     assert values["roll_accuracy_deg/sbg/ins/0"] == pytest.approx(0.230137)
-    assert "heading_true_north_deg/sbg/ins/0" not in values
-    assert "heading_magnetic_deg/sbg/ins/0" not in values
+    assert "heading_magnetic_deg/sbg/ins/0" not in values  # nan
     assert "magnetic_variation_deg/sbg/ins/0" not in values  # nan
 
 
