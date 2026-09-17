@@ -44,6 +44,55 @@ SBG device and streaming all the sensor data:
 ✅ status - System status
 ✅ utcTime - UTC timestamps
 
+### Heading, yaw and EKF validity
+
+`yaw_deg` is the Ellipse EKF yaw: the **geographic (true) heading**, signed
+−180…+180°, but only meaningful once the EKF has a heading reference (solution
+mode AHRS or better). In `VERTICAL_GYRO` mode it drifts freely. The connector
+reads the EKF status bitmask that `--status-format=decimal` prints first on each
+`euler`/`nav` line and publishes on `sbg/ins/0`:
+
+| Subject | Source | Published |
+|---|---|---|
+| `roll_deg`, `pitch_deg`, `yaw_deg` | euler | always |
+| `roll_accuracy_deg`, `pitch_accuracy_deg`, `heading_accuracy_deg` | euler std dev (1σ) | always |
+| `heading_true_north_deg` | yaw, 0…360° | always — check `heading_accuracy_deg` (180° = unknown) |
+| `heading_magnetic_deg` | euler magnetic heading, 0…360° | when available |
+| `magnetic_variation_deg` | magnetic declination, east positive | when available |
+| `yaw_rate_degps` | IMU gyro Y/Z + latest roll/pitch | always (needs no heading reference) |
+| `location_fix`, `location_fix_accuracy_horizontal_m`, `location_fix_accuracy_vertical_m` | nav | only when **position valid** |
+| `ned_velocity_mps` | nav | only when **velocity valid** |
+
+Every change of EKF mode or validity is logged once at WARNING, e.g.
+`SBG EKF euler: mode=VERTICAL_GYRO status=0x111 heading_valid=NO`. Heading is
+published even while not valid; the INS position and velocity are not (they
+integrate freely and are meaningless), which the same log explains.
+
+`angular_velocity_radps` is converted from the deg/s that `sbgBasicLogger` prints.
+
+### GNSS receiver (`sbg/gnss/0`)
+
+Besides `location_fix`, velocity, course and satellite counts, the GNSS
+receiver's own solution publishes `location_fix_quality` (fix type, position type
+e.g. `POS_TYPE_PSRDIFF`, RTK status) and `location_fix_accuracy_horizontal_m` /
+`_vertical_m`. The "GNSS corrections do not look valid" warning is only logged
+with `--enable-rtcm-input`; without RTCM the base station id is always invalid.
+
+### Device status and magnetometer
+
+The `status` log is logged at WARNING whenever a general health bit (power,
+settings, temperature, CPU…) or an aiding input's *received* bit (GNSS1
+position/velocity/UTC, magnetometer, air data) changes. Compare it with the EKF
+log line: an input can be received but not used by the EKF.
+
+`mag` is not published: the Ellipse reports magnetometers in arbitrary units
+(not gauss) and its accelerometers duplicate `imuData`. It stays in the raw
+recording with `--pub-raw`.
+
+Only **one** process may read the SBG serial port. Two readers split the byte
+stream between them (`SBG_INVALID_FRAME` / CRC errors, `sbgBasicLogger`
+assertion aborts).
+
 
 
 

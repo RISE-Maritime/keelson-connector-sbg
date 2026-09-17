@@ -57,13 +57,7 @@ def terminal_inputs():
         help="Source id being a unique id representing the source of the data",
     )
 
-    parser.add_argument(
-        "-f", 
-        "--frame-id", 
-        type=str,
-        default=None, 
-        required=False
-    )
+    parser.add_argument("-f", "--frame-id", type=str, default=None, required=False)
 
     parser.add_argument(
         "--pub-raw",

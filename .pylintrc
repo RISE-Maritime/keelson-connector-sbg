@@ -1,0 +1,23 @@
+# Pylint configuration for the SBG connector scripts in bin/ (run by CI as
+# `pylint bin/*`).
+[MESSAGES CONTROL]
+disable=
+    # Field names mirror sbgBasicLogger columns with their units (velN_mps,
+    # gyroX_degps) and keelson subject names; renaming would hide the mapping.
+    invalid-name,
+    missing-module-docstring,
+    missing-class-docstring,
+    missing-function-docstring,
+    # Parsed log records are plain dataclasses with one field per column.
+    too-many-instance-attributes,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-locals,
+    too-many-lines,
+    # Single-process script: rate counters and last-seen state are module globals.
+    global-statement,
+    # main's tolerant GNSS1POS fallback intentionally mirrors sbg_parser's.
+    duplicate-code,
+
+[FORMAT]
+max-line-length=100
